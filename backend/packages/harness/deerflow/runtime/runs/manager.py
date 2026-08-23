@@ -1004,6 +1004,16 @@ class RunManager:
                     stop_reason=stop_reason,
                 ),
             )
+        except asyncio.CancelledError:
+            async with self._lock:
+                record = self._runs.get(run_id)
+            if record is not None:
+                await self._mark_ownership_lost(
+                    record,
+                    reason=("The durable store could not confirm whether cancellation or completion won."),
+                    require_active=False,
+                )
+            raise
         except Exception:
             async with self._lock:
                 record = self._runs.get(run_id)

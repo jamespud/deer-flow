@@ -339,6 +339,17 @@ class McpTaskService:
                 input_required=snapshot.input_required,
                 completed_at=datetime.now(UTC),
             )
+        except asyncio.CancelledError:
+            # Cancellation after a remote-side cancel must still release the
+            # cancel claim so it is retried promptly rather than waiting for the
+            # lease to lapse; preserve the original cancellation.
+            await self._repository.release_cancel_claim(
+                record["id"],
+                lease_owner=self._lease_owner,
+                next_cancel_at=datetime.now(UTC),
+                error="cancelled",
+            )
+            raise
         except Exception as exc:  # noqa: BLE001 - remote cancellation is retryable
             attempts = max(0, int(record.get("cancel_attempt_count") or 1) - 1)
             retry_seconds = min(self._poll_interval_seconds * (2 ** min(attempts, 16)), self._max_poll_backoff_seconds)
@@ -459,6 +470,15 @@ class McpTaskService:
                 dispatch_attempt=int(record.get("dispatch_attempt") or 0),
                 event=dict(record.get("dispatch_event") or {}),
             )
+        except asyncio.CancelledError:
+            await self._repository.release_notification_claim(
+                task_id,
+                lease_owner=self._lease_owner,
+                next_notification_at=datetime.now(UTC),
+                error="cancelled",
+                replace_with_latest=False,
+            )
+            raise
         except PermanentNotificationError as exc:
             await self._repository.dead_letter_notification(
                 task_id,
@@ -516,6 +536,9 @@ class McpTaskService:
 
         try:
             snapshot = self._normalize_snapshot(await driver.get_status(TaskReference.from_record(record)))
+        except asyncio.CancelledError:
+            await self._release_after_error(record, now=datetime.now(UTC), error="cancelled")
+            raise
         except McpTaskProtocolError as exc:
             logger.error(
                 "MCP task status contract failed permanently (task_id=%s, driver=%s): %s",

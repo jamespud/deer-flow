@@ -1417,3 +1417,48 @@ async def test_stop_cancels_a_hung_driver_poll():
     await asyncio.wait_for(service.stop(), timeout=1)
 
     assert driver.cancelled is True
+
+
+class CancellationBlockingApplyRepo(FakeRepository):
+    """``apply_cancel_snapshot`` blocks so the caller can be cancelled mid-flight."""
+
+    def __init__(self):
+        super().__init__()
+        self.apply_started = asyncio.Event()
+        self.release_cancel_calls = []
+
+    async def apply_cancel_snapshot(self, task_id, **kwargs):
+        self.applied.append((task_id, kwargs))
+        self.apply_started.set()
+        await asyncio.Event().wait()
+
+    async def release_cancel_claim(self, task_id, **kwargs):
+        self.release_cancel_calls.append((task_id, kwargs))
+        return True
+
+
+def test_cancel_one_releases_claim_when_cancelled():
+    """A cancel that lands mid-``_cancel_one`` must still release the claim."""
+    repo = CancellationBlockingApplyRepo()
+    driver = FakeDriver()  # cancel() returns a CANCELLED snapshot
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", driver)
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    record = _claimed_row()
+
+    async def main():
+        task = asyncio.create_task(service._cancel_one(record))
+        await repo.apply_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert repo.release_cancel_calls
+        assert repo.release_cancel_calls[0][0] == record["id"]
+
+    asyncio.run(main())
