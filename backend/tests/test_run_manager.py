@@ -682,6 +682,177 @@ async def test_shutdown_cancellation_propagates_while_waiting_for_cleanup_produc
 
 
 @pytest.mark.anyio
+async def test_shutdown_bounds_initial_manager_lock_wait(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    await manager._lock.acquire()
+    started = asyncio.get_running_loop().time()
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(manager.shutdown(timeout=0.01), timeout=0.2)
+    finally:
+        manager._lock.release()
+
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert "could not acquire manager lock" in caplog.text
+    await asyncio.wait_for(manager._lock.acquire(), timeout=0.1)
+    manager._lock.release()
+    assert not getattr(manager._lock, "_waiters", ())
+
+
+@pytest.mark.anyio
+async def test_shutdown_bounds_post_wait_manager_lock_wait(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    run_started = asyncio.Event()
+    lock_held = asyncio.Event()
+    release_lock = asyncio.Event()
+
+    async def run() -> None:
+        run_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await manager._lock.acquire()
+            lock_held.set()
+            await release_lock.wait()
+            manager._lock.release()
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    await run_started.wait()
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.03))
+
+    try:
+        await asyncio.wait_for(lock_held.wait(), timeout=0.2)
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(shutdown_task, timeout=0.2)
+    finally:
+        release_lock.set()
+        await record.task
+
+    assert "could not acquire manager lock" in caplog.text
+    await asyncio.wait_for(manager._lock.acquire(), timeout=0.1)
+    manager._lock.release()
+    assert not getattr(manager._lock, "_waiters", ())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("late_failure", [False, True], ids=["success", "failure"])
+async def test_shutdown_supervises_late_status_persistence_without_cancelling_or_retrying(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    late_failure: bool,
+):
+    manager = RunManager(store=MemoryRunStore())
+    run_started = asyncio.Event()
+    release_persist = asyncio.Event()
+    persist_started = asyncio.Event()
+    persist_calls = 0
+
+    async def run() -> None:
+        run_started.set()
+        await asyncio.Event().wait()
+
+    async def stubborn_persist(_record: Any, _status: RunStatus, **_kwargs: Any) -> bool:
+        nonlocal persist_calls
+        persist_calls += 1
+        persist_started.set()
+        try:
+            await release_persist.wait()
+        except asyncio.CancelledError:
+            raise AssertionError("shutdown must not cancel status persistence")
+        if late_failure:
+            raise RuntimeError("late shutdown persistence failed")
+        return True
+
+    monkeypatch.setattr(manager, "_persist_status", stubborn_persist)
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    await run_started.wait()
+
+    with caplog.at_level(logging.WARNING):
+        shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.03))
+        await asyncio.wait_for(persist_started.wait(), timeout=0.2)
+        persistence_task = next(iter(manager._shutdown_persistence_tasks))
+        await asyncio.wait_for(shutdown_task, timeout=0.15)
+
+        assert persistence_task.done() is False
+        assert persistence_task in manager._shutdown_persistence_tasks
+        assert persist_calls == 1
+        release_persist.set()
+        await persistence_task
+        await asyncio.sleep(0)
+
+    assert not manager._shutdown_persistence_tasks
+    assert persist_calls == 1
+    if late_failure:
+        assert caplog.text.count("late shutdown persistence failed") == 1
+
+
+@pytest.mark.anyio
+async def test_heartbeat_does_not_schedule_orphans_after_stop_during_renewal(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    manager = RunManager(
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=5,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    renewal_started = asyncio.Event()
+    renewal_cancelled = asyncio.Event()
+    release_renewal = asyncio.Event()
+    renewal_calls = 0
+    scheduled_orphans: list[None] = []
+    real_asyncio = manager_module.asyncio
+
+    class FastAsyncio:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_asyncio, name)
+
+        async def wait_for(self, awaitable: Any, timeout: float) -> Any:
+            if timeout == 1:
+                awaitable.close()
+                raise TimeoutError
+            return await real_asyncio.wait_for(awaitable, timeout)
+
+    async def renew_leases() -> None:
+        nonlocal renewal_calls
+        renewal_calls += 1
+        if renewal_calls != 3:
+            return
+        renewal_started.set()
+        try:
+            await release_renewal.wait()
+        except asyncio.CancelledError:
+            renewal_cancelled.set()
+            await release_renewal.wait()
+
+    monkeypatch.setattr(manager_module, "asyncio", FastAsyncio())
+    monkeypatch.setattr(manager, "_renew_leases", renew_leases)
+    monkeypatch.setattr(
+        manager,
+        "_schedule_orphan_reconciliation",
+        lambda: scheduled_orphans.append(None),
+    )
+
+    await manager.start_heartbeat()
+    task = manager._heartbeat_task
+    assert task is not None
+    await renewal_started.wait()
+
+    await manager.stop_heartbeat(timeout=0.01)
+    await asyncio.wait_for(renewal_cancelled.wait(), timeout=0.2)
+    release_renewal.set()
+    await task
+    await asyncio.sleep(0)
+
+    assert renewal_calls == 3
+    assert scheduled_orphans == []
+
+
+@pytest.mark.anyio
 async def test_stop_heartbeat_stubborn_task_keeps_one_background_owner_after_deadline(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

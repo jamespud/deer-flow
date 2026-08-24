@@ -7,6 +7,7 @@ import logging
 import socket
 import sqlite3
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -257,6 +258,9 @@ class RunManager:
         self._cancellation_cleanup_tasks: set[asyncio.Future[None]] = set()
         self._cancellation_cleanup_producers: set[object] = set()
         self._cancellation_cleanup_state_changed = asyncio.Event()
+        self._shutdown_persistence_tasks: set[asyncio.Task[bool | BaseException]] = set()
+        self._shutdown_persistence_records: dict[asyncio.Task[bool | BaseException], RunRecord] = {}
+        self._shutdown_persistence_observed: weakref.WeakSet[asyncio.Task[bool | BaseException]] = weakref.WeakSet()
 
     def _begin_cancellation_cleanup_producer(self) -> Callable[[], None]:
         """Register a producer that may later track cancellation cleanup.
@@ -367,6 +371,127 @@ class RunManager:
                 exc,
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
+
+    async def _cancel_and_settle_lock_waiter(self, waiter: asyncio.Task[bool]) -> bool:
+        """Cancel a manager-lock waiter and settle it despite caller cancellation."""
+        if not waiter.done():
+            waiter.cancel()
+        while not waiter.done():
+            try:
+                await asyncio.shield(waiter)
+            except asyncio.CancelledError:
+                # A second cancellation must not leave the lock waiter owned by
+                # the event loop after shutdown has already returned.
+                continue
+            except BaseException:
+                break
+        if waiter.cancelled():
+            return False
+        try:
+            return waiter.result()
+        except asyncio.CancelledError:
+            return False
+        except BaseException as exc:  # noqa: BLE001 - do not replace caller cancellation
+            logger.warning(
+                "Manager lock acquisition waiter failed while settling: %s",
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            return False
+
+    async def _acquire_lock_until(self, deadline: float) -> bool:
+        """Acquire the manager lock without exceeding an absolute deadline."""
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return False
+
+        waiter = asyncio.create_task(self._lock.acquire())
+        try:
+            done, _ = await asyncio.wait((waiter,), timeout=remaining)
+        except asyncio.CancelledError:
+            acquired = await self._cancel_and_settle_lock_waiter(waiter)
+            if acquired:
+                self._lock.release()
+            raise
+
+        if waiter in done:
+            try:
+                acquired = waiter.result()
+            except asyncio.CancelledError:
+                return False
+            if acquired and asyncio.get_running_loop().time() >= deadline:
+                self._lock.release()
+                return False
+            return acquired
+
+        acquired = await self._cancel_and_settle_lock_waiter(waiter)
+        if acquired and asyncio.get_running_loop().time() >= deadline:
+            self._lock.release()
+            return False
+        return acquired
+
+    def _observe_shutdown_persistence(
+        self,
+        task: asyncio.Task[bool | BaseException],
+        record: RunRecord,
+    ) -> None:
+        """Consume one shutdown persistence result, at most once."""
+        if task in self._shutdown_persistence_observed:
+            return
+        self._shutdown_persistence_observed.add(task)
+        try:
+            result = task.result()
+        except asyncio.CancelledError:
+            logger.warning(
+                "Shutdown status persistence was cancelled for run %s",
+                record.run_id,
+            )
+        except BaseException as exc:  # noqa: BLE001 - callback must consume all failures
+            logger.warning(
+                "Shutdown status persistence failed for run %s: %s",
+                record.run_id,
+                exc,
+            )
+        else:
+            if isinstance(result, asyncio.CancelledError):
+                logger.warning(
+                    "Shutdown status persistence was cancelled for run %s",
+                    record.run_id,
+                )
+            elif isinstance(result, BaseException):
+                logger.warning(
+                    "Shutdown status persistence failed for run %s: %s",
+                    record.run_id,
+                    result,
+                )
+            elif result is False:
+                logger.warning(
+                    "Could not persist interrupted status for run %s during shutdown",
+                    record.run_id,
+                )
+
+    def _shutdown_persistence_done(self, task: asyncio.Task[bool | BaseException]) -> None:
+        """Release task ownership and consume a late persistence result."""
+        record = self._shutdown_persistence_records.pop(task, None)
+        self._shutdown_persistence_tasks.discard(task)
+        if record is not None:
+            self._observe_shutdown_persistence(task, record)
+
+    async def _run_shutdown_persistence(self, record: RunRecord) -> bool | BaseException:
+        """Return persistence failures for the supervisor to observe."""
+        try:
+            return await self._persist_status(record, RunStatus.interrupted)
+        except BaseException as exc:  # noqa: BLE001 - supervisor owns the result
+            return exc
+
+    def _start_shutdown_persistence(self, record: RunRecord) -> asyncio.Task[bool | BaseException]:
+        """Start and immediately supervise one shutdown status persistence."""
+        task = asyncio.create_task(self._run_shutdown_persistence(record))
+        task.set_name(f"deerflow-shutdown-persist-status-{record.run_id}")
+        self._shutdown_persistence_tasks.add(task)
+        self._shutdown_persistence_records[task] = record
+        task.add_done_callback(self._shutdown_persistence_done)
+        return task
 
     def _index_run_locked(self, record: RunRecord) -> None:
         """Register *record* in the thread index. Caller must hold ``self._lock``."""
@@ -2195,6 +2320,9 @@ class RunManager:
             except Exception:
                 logger.warning("Heartbeat renewal cycle failed", exc_info=True)
 
+            if stop.is_set():
+                break
+
             # Reconcile every 3rd cycle (= every lease_seconds). Startup
             # reconciliation (in langgraph_runtime) covers the initial
             # sweep; this periodic pass catches orphans whose lease
@@ -2429,14 +2557,23 @@ class RunManager:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.0, timeout)
 
-        async with self._lock:
-            inflight = [record for record in self._runs.values() if record.status in (RunStatus.pending, RunStatus.running) and record.task is not None and not record.task.done()]
-            for record in inflight:
-                record.abort_action = "interrupt"
-                record.abort_event.set()
-                record.task.cancel()  # type: ignore[union-attr]  # filtered above
-                # Status is decided AFTER the drain (below), not here: a run that
-                # completes on its own during the drain must keep its real status.
+        inflight: list[RunRecord] = []
+        initial_lock_acquired = await self._acquire_lock_until(deadline)
+        if initial_lock_acquired:
+            try:
+                inflight = [record for record in self._runs.values() if record.status in (RunStatus.pending, RunStatus.running) and record.task is not None and not record.task.done()]
+                for record in inflight:
+                    record.abort_action = "interrupt"
+                    record.abort_event.set()
+                    record.task.cancel()  # type: ignore[union-attr]  # filtered above
+                    # Status is decided AFTER the drain (below), not here: a run that
+                    # completes on its own during the drain must keep its real status.
+            finally:
+                self._lock.release()
+        else:
+            logger.warning(
+                "Run shutdown could not acquire manager lock before deadline; unable to snapshot or cancel in-flight runs",
+            )
 
         await self.stop_heartbeat(timeout=max(0.0, deadline - loop.time()))
 
@@ -2468,44 +2605,51 @@ class RunManager:
         # own (still pending after the timeout, or ended cancelled). A run that
         # finished normally during the drain keeps the status it set for itself.
         to_persist: list[RunRecord] = []
-        async with self._lock:
-            for record in inflight:
-                task = record.task
-                if task not in pending_run_tasks and not task.cancelled():
-                    # Completed on its own — retrieve any surfaced exception so it
-                    # is not reported as "never retrieved", and keep its status.
-                    task.exception()  # type: ignore[union-attr]  # done & not cancelled
-                    continue
-                if record.status in (RunStatus.pending, RunStatus.running):
-                    record.status = RunStatus.interrupted
-                    record.updated_at = _now_iso()
-                to_persist.append(record)
+        post_wait_lock_acquired = await self._acquire_lock_until(deadline)
+        if post_wait_lock_acquired:
+            try:
+                for record in inflight:
+                    task = record.task
+                    if task not in pending_run_tasks and not task.cancelled():
+                        # Completed on its own — retrieve any surfaced exception so it
+                        # is not reported as "never retrieved", and keep its status.
+                        task.exception()  # type: ignore[union-attr]  # done & not cancelled
+                        continue
+                    if record.status in (RunStatus.pending, RunStatus.running):
+                        record.status = RunStatus.interrupted
+                        record.updated_at = _now_iso()
+                    to_persist.append(record)
+            finally:
+                self._lock.release()
+        elif initial_lock_acquired:
+            logger.warning(
+                "Run shutdown could not acquire manager lock before deadline after draining runs; skipping status mutation and persistence",
+            )
 
         # Bound the trailing status persistence within the remaining budget so a
         # slow store (``_call_store_with_retry`` can back off under DB pressure)
         # cannot push shutdown past ``timeout``.
         if to_persist:
+            persistence_records = [(self._start_shutdown_persistence(record), record) for record in to_persist]
             remaining = deadline - loop.time()
             if remaining <= 0:
-                logger.warning("Run drain budget exhausted before persisting %d interrupted run(s) on shutdown", len(to_persist))
+                logger.warning("Run drain budget exhausted before persisting %d interrupted run(s) on shutdown; tasks remain supervised in the background", len(to_persist))
+                done: set[asyncio.Task[bool | BaseException]] = set()
             else:
-                try:
-                    results = await asyncio.wait_for(
-                        asyncio.gather(*(self._persist_status(record, RunStatus.interrupted) for record in to_persist), return_exceptions=True),
-                        timeout=remaining,
-                    )
-                except TimeoutError:
-                    logger.warning("Run drain status persistence exceeded the %.1fs budget; %d record(s) may not be persisted", timeout, len(to_persist))
-                else:
-                    # ``_persist_status`` is best-effort: it catches and logs its
-                    # own failures, returning ``False``. Inspect the aggregate so a
-                    # partial failure is surfaced at shutdown level (with the
-                    # run_id) instead of being silently swallowed by the gather.
-                    for record, result in zip(to_persist, results):
-                        if isinstance(result, Exception):
-                            logger.warning("Unexpected error persisting interrupted status for run %s during shutdown: %r", record.run_id, result)
-                        elif result is False:
-                            logger.warning("Could not persist interrupted status for run %s during shutdown", record.run_id)
+                done, _ = await asyncio.wait(
+                    [task for task, _record in persistence_records],
+                    timeout=remaining,
+                )
+            for task, record in persistence_records:
+                if task in done:
+                    self._observe_shutdown_persistence(task, record)
+            pending_persistence_count = sum(1 for task, _record in persistence_records if not task.done())
+            if pending_persistence_count:
+                logger.warning(
+                    "Run drain status persistence exceeded the %.1fs budget; %d record(s) remain supervised in the background",
+                    timeout,
+                    pending_persistence_count,
+                )
 
         pending_cleanup_count = sum(1 for task in self._cancellation_cleanup_tasks if not task.done())
         if pending_cleanup_count:
