@@ -461,6 +461,7 @@ async def test_shutdown_observes_cleanup_registered_by_cancelled_run_before_dead
     manager = RunManager()
     cleanup_finished = asyncio.Event()
     cleanup_registered = asyncio.Event()
+    release_producer = manager._begin_cancellation_cleanup_producer()
 
     async def run() -> None:
         try:
@@ -469,6 +470,8 @@ async def test_shutdown_observes_cleanup_registered_by_cancelled_run_before_dead
             cleanup = asyncio.create_task(cleanup_finished.wait())
             manager._track_cancellation_cleanup(cleanup, action="dynamic cleanup", run_id="run-1")
             cleanup_registered.set()
+        finally:
+            release_producer()
 
     record = await manager.create("thread-1")
     record.task = asyncio.create_task(run())
@@ -485,6 +488,7 @@ async def test_shutdown_keeps_dynamic_cleanup_supervised_after_deadline(caplog: 
     manager = RunManager()
     cleanup_registered = asyncio.Event()
     cleanup_finished = asyncio.Event()
+    release_producer = manager._begin_cancellation_cleanup_producer()
 
     async def run() -> None:
         try:
@@ -493,6 +497,8 @@ async def test_shutdown_keeps_dynamic_cleanup_supervised_after_deadline(caplog: 
             cleanup = asyncio.create_task(cleanup_finished.wait())
             manager._track_cancellation_cleanup(cleanup, action="stalled dynamic cleanup", run_id="run-1")
             cleanup_registered.set()
+        finally:
+            release_producer()
 
     record = await manager.create("thread-1")
     record.task = asyncio.create_task(run())
@@ -516,12 +522,14 @@ async def test_shutdown_waits_for_delayed_run_completion_cleanup_registration():
     cleanup_finished = asyncio.Event()
     cleanup_registered = asyncio.Event()
     loop = asyncio.get_running_loop()
+    release_producer = manager._begin_cancellation_cleanup_producer()
 
     async def register_cleanup() -> None:
         await asyncio.sleep(0)
         cleanup = asyncio.create_task(cleanup_finished.wait())
         manager._track_cancellation_cleanup(cleanup, action="delayed cleanup", run_id="run-1")
         cleanup_registered.set()
+        release_producer()
 
     async def run() -> None:
         try:
@@ -562,12 +570,14 @@ async def test_shutdown_keeps_delayed_stalled_cleanup_supervised_until_deadline(
     cleanup_finished = asyncio.Event()
     cleanup_registered = asyncio.Event()
     loop = asyncio.get_running_loop()
+    release_producer = manager._begin_cancellation_cleanup_producer()
 
     async def register_cleanup() -> None:
         await asyncio.sleep(0)
         cleanup = asyncio.create_task(cleanup_finished.wait())
         manager._track_cancellation_cleanup(cleanup, action="delayed stalled cleanup", run_id="run-1")
         cleanup_registered.set()
+        release_producer()
 
     async def run() -> None:
         try:
@@ -604,6 +614,71 @@ async def test_shutdown_keeps_delayed_stalled_cleanup_supervised_until_deadline(
     await cleanup
     await asyncio.sleep(0)
     assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_waits_for_registered_cleanup_producer_through_deep_callback_chain():
+    manager = RunManager()
+    cleanup_finished = asyncio.Event()
+    cleanup_registered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+
+    def callback(depth: int) -> None:
+        if depth < 100:
+            loop.call_soon(callback, depth + 1)
+            return
+        cleanup = asyncio.create_task(cleanup_finished.wait())
+        manager._track_cancellation_cleanup(cleanup, action="deep delayed cleanup", run_id="run-1")
+        cleanup_registered.set()
+        release_producer()
+
+    loop.call_soon(callback, 0)
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.05))
+    await asyncio.wait_for(cleanup_registered.wait(), timeout=0.2)
+    assert shutdown_task.done() is False
+    cleanup_finished.set()
+    await shutdown_task
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_waits_for_cleanup_producer_that_finishes_without_registration():
+    manager = RunManager()
+    producer_released = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+
+    def callback(depth: int) -> None:
+        if depth < 100:
+            loop.call_soon(callback, depth + 1)
+            return
+        release_producer()
+        producer_released.set()
+
+    loop.call_soon(callback, 0)
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.2))
+    await asyncio.wait_for(producer_released.wait(), timeout=0.2)
+    await shutdown_task
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_cancellation_propagates_while_waiting_for_cleanup_producer():
+    manager = RunManager()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+    manager._cancellation_cleanup_state_changed.clear()
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=1.0))
+    await asyncio.sleep(0)
+    assert shutdown_task.done() is False
+
+    shutdown_task.cancel("shutdown cancelled")
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await shutdown_task
+    assert caught.value.args == ("shutdown cancelled",)
+    assert manager._cancellation_cleanup_producers
+    release_producer()
+    await asyncio.sleep(0)
 
 
 @pytest.mark.anyio

@@ -255,7 +255,32 @@ class RunManager:
         self._heartbeat_cancel_requested = False
         self._orphan_recovery_cancel_requested = False
         self._cancellation_cleanup_tasks: set[asyncio.Future[None]] = set()
-        self._cancellation_cleanup_generation = 0
+        self._cancellation_cleanup_producers: set[object] = set()
+        self._cancellation_cleanup_state_changed = asyncio.Event()
+
+    def _begin_cancellation_cleanup_producer(self) -> Callable[[], None]:
+        """Register a producer that may later track cancellation cleanup.
+
+        Callers must acquire this token before scheduling any callback that can
+        call ``_track_cancellation_cleanup`` and release it only after that
+        callback has either tracked its cleanup or established that none is
+        needed. Direct, unsupervised calls to ``_track_cancellation_cleanup``
+        are supported only when no registration gap can exist.
+        """
+        token = object()
+        self._cancellation_cleanup_producers.add(token)
+        self._cancellation_cleanup_state_changed.set()
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if released:
+                return
+            released = True
+            self._cancellation_cleanup_producers.discard(token)
+            self._cancellation_cleanup_state_changed.set()
+
+        return release
 
     def _track_cancellation_cleanup(
         self,
@@ -268,12 +293,12 @@ class RunManager:
         if task in self._cancellation_cleanup_tasks:
             return
         self._cancellation_cleanup_tasks.add(task)
-        self._cancellation_cleanup_generation += 1
+        self._cancellation_cleanup_state_changed.set()
 
         def finalize(completed: asyncio.Future[None]) -> None:
             if completed in self._cancellation_cleanup_tasks:
                 self._cancellation_cleanup_tasks.discard(completed)
-                self._cancellation_cleanup_generation += 1
+                self._cancellation_cleanup_state_changed.set()
             try:
                 error = completed.exception()
             except asyncio.CancelledError as exc:
@@ -290,37 +315,20 @@ class RunManager:
 
         task.add_done_callback(finalize)
 
-    @staticmethod
-    def _loop_has_pending_callbacks(loop: asyncio.AbstractEventLoop) -> bool:
-        """Return whether the loop has callbacks ready for another turn.
-
-        The private queues are used only for shutdown quiescence: a done-task
-        callback can enqueue another callback after the manager's own await has
-        resumed. Checking the queues lets us drain that finite callback chain
-        without guessing a fixed number of ``sleep(0)`` turns.
-        """
-        ready = getattr(loop, "_ready", ())
-        if any(not handle.cancelled() for handle in ready):
-            return True
-        now = loop.time()
-        scheduled = getattr(loop, "_scheduled", ())
-        return any(not handle.cancelled() and getattr(handle, "_when", now + 1) <= now for handle in scheduled)
-
-    async def _await_cleanup_registration_quiescence(self, *, deadline: float) -> bool:
-        """Wait for a stable event-loop turn before ending shutdown ownership."""
+    async def _wait_for_cancellation_cleanup_state_change(self, *, deadline: float) -> bool:
+        """Wait for producer or cleanup ownership to change until *deadline*."""
         loop = asyncio.get_running_loop()
-        generation = self._cancellation_cleanup_generation
-        while True:
-            barrier = loop.create_future()
-            loop.call_soon(barrier.set_result, None)
-            if not await wait_for_task_until(barrier, deadline=deadline):
-                return False
-            if self._cancellation_cleanup_generation != generation:
-                generation = self._cancellation_cleanup_generation
-                continue
-            if self._loop_has_pending_callbacks(loop):
-                continue
-            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        self._cancellation_cleanup_state_changed.clear()
+        try:
+            async with asyncio.timeout(remaining):
+                await self._cancellation_cleanup_state_changed.wait()
+        except TimeoutError:
+            return False
+        self._cancellation_cleanup_state_changed.clear()
+        return True
 
     async def _drain_cancellation_cleanup(
         self,
@@ -1118,11 +1126,15 @@ class RunManager:
                 await self._fence_unconfirmed_finalization(run_id)
                 return None
         except asyncio.CancelledError:
-            await self._drain_cancellation_cleanup(
-                self._fence_unconfirmed_finalization(run_id),
-                action="fence cancelled finalization",
-                run_id=run_id,
-            )
+            release_producer = self._begin_cancellation_cleanup_producer()
+            try:
+                await self._drain_cancellation_cleanup(
+                    self._fence_unconfirmed_finalization(run_id),
+                    action="fence cancelled finalization",
+                    run_id=run_id,
+                )
+            finally:
+                release_producer()
             raise
 
         if result.cancel_action is not None:
@@ -1821,11 +1833,15 @@ class RunManager:
             for interrupted_record in interrupted_records:
                 await self._persist_status(interrupted_record, RunStatus.interrupted)
         except asyncio.CancelledError:
-            await self._drain_cancellation_cleanup(
-                self._close_cancelled_admission(record),
-                action="close cancelled admission",
-                run_id=record.run_id,
-            )
+            release_producer = self._begin_cancellation_cleanup_producer()
+            try:
+                await self._drain_cancellation_cleanup(
+                    self._close_cancelled_admission(record),
+                    action="close cancelled admission",
+                    run_id=record.run_id,
+                )
+            finally:
+                release_producer()
             raise
 
         logger.info("Run created: run_id=%s thread_id=%s", run_id, thread_id)
@@ -2433,32 +2449,19 @@ class RunManager:
             active_run_tasks = {task for task in run_tasks if task is not None and not task.done()}
             active_cleanup_tasks = {task for task in self._cancellation_cleanup_tasks if not task.done()}
             owned_tasks = active_run_tasks | active_cleanup_tasks
-            if not owned_tasks:
-                if not await self._await_cleanup_registration_quiescence(deadline=deadline):
+            if owned_tasks:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
                     pending_run_tasks = active_run_tasks
                     break
-                active_run_tasks = {task for task in run_tasks if task is not None and not task.done()}
-                active_cleanup_tasks = {task for task in self._cancellation_cleanup_tasks if not task.done()}
-                if not active_run_tasks and not active_cleanup_tasks:
+                _, pending = await asyncio.wait(owned_tasks, timeout=remaining)
+                pending_run_tasks = {task for task in pending if task in active_run_tasks}
+                if loop.time() >= deadline:
                     break
                 continue
-
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                pending_run_tasks = active_run_tasks
+            if not self._cancellation_cleanup_producers:
                 break
-            _, pending = await asyncio.wait(owned_tasks, timeout=remaining)
-            pending_run_tasks = {task for task in pending if task in active_run_tasks}
-
-            # ``Task`` done callbacks run on the next event-loop turn. Give a
-            # run's cancellation handler a chance to register its cleanup
-            # before deciding that the owned set reached a fixed point.
-            if pending:
-                await asyncio.sleep(0)
-            elif loop.time() < deadline:
-                await asyncio.sleep(0)
-
-            if loop.time() >= deadline:
+            if not await self._wait_for_cancellation_cleanup_state_change(deadline=deadline):
                 break
 
         # Only mark/persist ``interrupted`` for runs that did not settle on their
