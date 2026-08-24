@@ -881,20 +881,49 @@ class McpTaskService:
         if self._task is not None:
             return
         self._stop.clear()
-        self._task = asyncio.create_task(self._run_loop(), name="deerflow-mcp-task-poller")
+        task = asyncio.create_task(self._run_loop(), name="deerflow-mcp-task-poller")
+        self._task = task
+        task.add_done_callback(self._poller_done)
+
+    def _poller_done(self, task: asyncio.Task[None]) -> None:
+        if self._task is task:
+            self._task = None
+        error = _consume_task_error(task)
+        if error is None or isinstance(error, asyncio.CancelledError):
+            return
+        logger.error(
+            "MCP task poller failed: %s",
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
 
     async def stop(self) -> None:
         task = self._task
         if task is None:
             return
+        was_stopping = self._stop.is_set()
         self._stop.set()
-        task.cancel()
+        if not was_stopping:
+            task.cancel()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
         try:
-            await task
+            done, _ = await asyncio.wait(
+                {task},
+                timeout=max(0.0, deadline - loop.time()),
+            )
         except asyncio.CancelledError:
-            pass
-        finally:
-            self._task = None
+            if not await wait_for_task_until(task, deadline=deadline):
+                logger.warning(
+                    "Timed out after %.1f seconds waiting for MCP task poller cleanup; cleanup continues in the background",
+                    _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                )
+            raise
+        if task not in done:
+            logger.warning(
+                "Timed out after %.1f seconds waiting for MCP task poller cleanup; cleanup continues in the background",
+                _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+            )
 
     async def _run_loop(self) -> None:
         while not self._stop.is_set():

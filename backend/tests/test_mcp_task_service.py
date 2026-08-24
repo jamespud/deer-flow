@@ -1419,6 +1419,166 @@ async def test_stop_cancels_a_hung_driver_poll():
     assert driver.cancelled is True
 
 
+@pytest.mark.asyncio
+async def test_stop_returns_with_timed_out_poller_and_start_does_not_overlap(monkeypatch):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    poller_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def stubborn_poller():
+        poller_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            try:
+                await finish.wait()
+            except asyncio.CancelledError:
+                # Make a second poller cancellation observable while keeping
+                # the test cleanup deterministic.
+                return
+
+    service = McpTaskService(
+        repository=FakeRepository(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=60,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    monkeypatch.setattr(service, "_run_loop", stubborn_poller)
+
+    await service.start()
+    await poller_started.wait()
+    poller = service._task
+    assert poller is not None
+
+    try:
+        await asyncio.wait_for(service.stop(), timeout=0.2)
+        await cleanup_started.wait()
+
+        assert service._task is poller
+        assert not poller.done()
+
+        await service.start()
+        assert service._task is poller
+
+        finish.set()
+        await asyncio.wait_for(poller, timeout=0.2)
+        await asyncio.sleep(0)
+        assert service._task is None
+    finally:
+        finish.set()
+        if not poller.done():
+            await asyncio.wait_for(poller, timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_stop_caller_cancellation_is_bounded_and_does_not_recancel_poller(monkeypatch, caplog):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.05)
+    poller_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish = asyncio.Event()
+    cancellation_count = 0
+
+    async def stubborn_poller():
+        nonlocal cancellation_count
+        poller_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancellation_count += 1
+            cleanup_started.set()
+        while not finish.is_set():
+            try:
+                await finish.wait()
+            except asyncio.CancelledError:
+                cancellation_count += 1
+
+    service = McpTaskService(
+        repository=FakeRepository(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=60,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    monkeypatch.setattr(service, "_run_loop", stubborn_poller)
+
+    await service.start()
+    await poller_started.wait()
+    poller = service._task
+    assert poller is not None
+    caller = asyncio.create_task(service.stop())
+    await cleanup_started.wait()
+
+    try:
+        caller.cancel()
+        await asyncio.sleep(0)
+        caller.cancel()
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(caller), timeout=0.2)
+
+        assert cancellation_count == 1
+        assert service._task is poller
+        assert not poller.done()
+        assert "cleanup continues in the background" in caplog.text
+
+        await service.start()
+        assert service._task is poller
+
+        await service.stop()
+        assert cancellation_count == 1
+        assert service._task is poller
+
+        finish.set()
+        await asyncio.wait_for(poller, timeout=0.2)
+        await asyncio.sleep(0)
+        assert service._task is None
+    finally:
+        finish.set()
+        if not poller.done():
+            await asyncio.wait_for(poller, timeout=0.2)
+        if not caller.done():
+            caller.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+
+
+@pytest.mark.asyncio
+async def test_finished_poller_failure_is_logged_and_clears_task(monkeypatch, caplog):
+    poller_started = asyncio.Event()
+    fail = asyncio.Event()
+
+    async def failing_poller():
+        poller_started.set()
+        await fail.wait()
+        raise RuntimeError("poller cleanup failed")
+
+    service = McpTaskService(
+        repository=FakeRepository(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=60,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    monkeypatch.setattr(service, "_run_loop", failing_poller)
+
+    with caplog.at_level(logging.ERROR):
+        await service.start()
+        await poller_started.wait()
+        poller = service._task
+        assert poller is not None
+        fail.set()
+        await asyncio.wait({poller})
+        await asyncio.sleep(0)
+
+    assert service._task is None
+    assert "MCP task poller failed" in caplog.text
+    assert "poller cleanup failed" in caplog.text
+
+
 class CancellationBlockingApplyRepo(FakeRepository):
     """``apply_cancel_snapshot`` blocks so the caller can be cancelled mid-flight."""
 
