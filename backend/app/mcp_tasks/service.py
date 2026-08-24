@@ -25,6 +25,7 @@ from deerflow.mcp.tasks import (
     TaskSubmitRequest,
 )
 from deerflow.persistence.mcp_tasks import DuplicateMcpRemoteTaskError
+from deerflow.runtime.cancellation import wait_for_task_until
 from deerflow.runtime.runs.manager import ConflictError
 from deerflow.runtime.runs.schemas import RunStatus
 
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 _MAX_PERSISTED_ERROR_CHARS = 4_000
 _MAX_INPUT_REQUIRED_BYTES = 65_536
 _MAX_NOTIFICATION_ATTEMPTS = 5
-_UNTRACKED_TASK_COMPENSATION_WAIT_SECONDS = 5.0
+_CANCELLATION_DRAIN_TIMEOUT_SECONDS = 5.0
 
 
 def _bound_error(error: str | None) -> str | None:
@@ -72,18 +73,11 @@ async def _drain_cancellation_operation(
     return False, None
 
 
-async def _drain_cancellation_compensation(
-    compensation: Awaitable[Any],
-    *,
-    action: str,
-    task_id: str,
-) -> None:
-    """Finish best-effort cleanup without replacing the caller's cancellation."""
-    await _drain_cancellation_operation(
-        compensation,
-        action=action,
-        task_id=task_id,
-    )
+def _consume_task_error(task: asyncio.Task[Any]) -> BaseException | None:
+    try:
+        return task.exception()
+    except asyncio.CancelledError as exc:
+        return exc
 
 
 class McpTaskService:
@@ -220,10 +214,7 @@ class McpTaskService:
 
         def finalize(task: asyncio.Task[Any]) -> None:
             self._compensation_tasks.discard(task)
-            try:
-                error = task.exception()
-            except asyncio.CancelledError as exc:
-                error = exc
+            error = _consume_task_error(task)
             if error is None:
                 return
             logger.error(
@@ -237,26 +228,80 @@ class McpTaskService:
 
         compensation.add_done_callback(finalize)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _UNTRACKED_TASK_COMPENSATION_WAIT_SECONDS
-        while not compensation.done():
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                logger.warning(
-                    "Timed out after %.1f seconds waiting for untracked MCP task compensation after %s; cancellation continues in the background (task_id=%s, driver=%s, remote_task_id=%s)",
-                    _UNTRACKED_TASK_COMPENSATION_WAIT_SECONDS,
-                    reason,
-                    task_reference.local_task_id,
-                    driver_name,
-                    task_reference.remote_task_id,
-                )
+        deadline = loop.time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+        if not await wait_for_task_until(compensation, deadline=deadline):
+            logger.warning(
+                "Timed out after %.1f seconds waiting for untracked MCP task compensation after %s; cancellation continues in the background (task_id=%s, driver=%s, remote_task_id=%s)",
+                _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                reason,
+                task_reference.local_task_id,
+                driver_name,
+                task_reference.remote_task_id,
+            )
+
+    def _track_compensation_task(self, task: asyncio.Task[Any], *, action: str, task_id: str) -> None:
+        self._compensation_tasks.add(task)
+
+        def finalize(completed: asyncio.Task[Any]) -> None:
+            self._compensation_tasks.discard(completed)
+            error = _consume_task_error(completed)
+            if error is None:
                 return
-            try:
-                await asyncio.wait({compensation}, timeout=remaining)
-            except asyncio.CancelledError:
-                # Repeated caller cancellation does not propagate through
-                # asyncio.wait() to the compensation task. Keep waiting only
-                # until the original deadline.
-                continue
+            logger.error(
+                "MCP task cancellation operation failed (%s, task_id=%s): %s",
+                action,
+                task_id,
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+        task.add_done_callback(finalize)
+
+    async def _drain_cancellation_task(
+        self,
+        task: asyncio.Task[Any],
+        *,
+        action: str,
+        task_id: str,
+        deadline: float,
+    ) -> tuple[bool, Any]:
+        if not await wait_for_task_until(task, deadline=deadline):
+            self._track_compensation_task(task, action=action, task_id=task_id)
+            logger.warning(
+                "Timed out after %.1f seconds waiting for MCP task cancellation operation; it continues in the background (%s, task_id=%s)",
+                _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                action,
+                task_id,
+            )
+            return False, None
+
+        error = _consume_task_error(task)
+        if error is not None:
+            logger.error(
+                "MCP task cancellation operation failed (%s, task_id=%s): %s",
+                action,
+                task_id,
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            return False, None
+        return True, task.result()
+
+    async def _drain_cancellation_compensation(
+        self,
+        compensation: Awaitable[Any],
+        *,
+        action: str,
+        task_id: str,
+    ) -> tuple[bool, Any]:
+        task = asyncio.ensure_future(compensation)
+        deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+        return await self._drain_cancellation_task(
+            task,
+            action=action,
+            task_id=task_id,
+            deadline=deadline,
+        )
 
     async def run_once(self, *, now: datetime) -> None:
         await self._run_cancellations(now=now)
@@ -641,7 +686,7 @@ class McpTaskService:
                 )
 
     async def _release_cancel_after_cancellation(self, record: dict[str, Any]) -> None:
-        await _drain_cancellation_compensation(
+        await self._drain_cancellation_compensation(
             self._repository.release_cancel_claim(
                 record["id"],
                 lease_owner=self._lease_owner,
@@ -672,14 +717,14 @@ class McpTaskService:
                 replace_with_latest=False,
             )
             action = "release notification claim"
-        await _drain_cancellation_compensation(
+        await self._drain_cancellation_compensation(
             compensation,
             action=action,
             task_id=task_id,
         )
 
     async def _release_poll_after_cancellation(self, record: dict[str, Any]) -> None:
-        await _drain_cancellation_compensation(
+        await self._drain_cancellation_compensation(
             self._release_after_error(record, now=datetime.now(UTC), error="cancelled"),
             action="release poll claim",
             task_id=record["id"],

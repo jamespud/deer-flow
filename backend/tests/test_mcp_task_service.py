@@ -347,7 +347,7 @@ async def test_submit_repeated_cancellation_does_not_interrupt_compensation():
 
 @pytest.mark.asyncio
 async def test_submit_stops_waiting_for_hung_compensation_without_cancelling_it(monkeypatch, caplog):
-    monkeypatch.setattr(service_module, "_UNTRACKED_TASK_COMPENSATION_WAIT_SECONDS", 0)
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0)
     repo = BlockingCreateRepository()
     driver = BlockingCancelDriver(
         submission=TaskSubmission(
@@ -2008,3 +2008,89 @@ async def test_poll_cancellation_preserves_cancelled_error_when_release_fails(ca
 
     assert repo.released
     assert "poll release unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_hung_cancellation_compensation_transfers_to_background(monkeypatch):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    release_started = asyncio.Event()
+    release_gate = asyncio.Event()
+    release_calls = []
+
+    async def release_claim(task_id, **_kwargs):
+        release_calls.append(task_id)
+        release_started.set()
+        await release_gate.wait()
+        return True
+
+    driver = HangingDriver()
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", driver)
+    service = McpTaskService(
+        repository=SimpleNamespace(release_claim=release_claim),
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    task = asyncio.create_task(service._poll_one(_claimed_row(), now=datetime.now(UTC)))
+    await driver.started.wait()
+    task.cancel()
+    await release_started.wait()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=0.2)
+
+    assert release_calls == ["task-1"]
+    assert len(service._compensation_tasks) == 1
+
+    release_gate.set()
+    await asyncio.gather(*service._compensation_tasks)
+    await asyncio.sleep(0)
+
+    assert not service._compensation_tasks
+
+
+@pytest.mark.asyncio
+async def test_background_compensation_failure_is_consumed(monkeypatch, caplog):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    release_started = asyncio.Event()
+    release_gate = asyncio.Event()
+    release_calls = []
+
+    async def release_claim(task_id, **_kwargs):
+        release_calls.append(task_id)
+        release_started.set()
+        await release_gate.wait()
+        raise RuntimeError("release remained unavailable")
+
+    driver = HangingDriver()
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", driver)
+    service = McpTaskService(
+        repository=SimpleNamespace(release_claim=release_claim),
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    task = asyncio.create_task(service._poll_one(_claimed_row(), now=datetime.now(UTC)))
+    await driver.started.wait()
+    task.cancel()
+    await release_started.wait()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=0.2)
+
+    assert release_calls == ["task-1"]
+    assert len(service._compensation_tasks) == 1
+
+    with caplog.at_level(logging.ERROR):
+        release_gate.set()
+        await asyncio.gather(*service._compensation_tasks, return_exceptions=True)
+        await asyncio.sleep(0)
+
+    assert "release remained unavailable" in caplog.text
+    assert not service._compensation_tasks
