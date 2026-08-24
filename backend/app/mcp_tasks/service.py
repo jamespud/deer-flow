@@ -195,8 +195,10 @@ class McpTaskService:
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
+            caller_cancelling = asyncio.current_task().cancelling()
             self._observe_batch_release_task(state, task, ordinary=True, action=action)
-            if task.cancelled() and not asyncio.current_task().cancelling():
+            release_cancelled = state.ordinary_release_terminal or (task.done() and task.cancelled())
+            if release_cancelled and not caller_cancelling:
                 return
             raise
         except Exception:

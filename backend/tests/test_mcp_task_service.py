@@ -3070,6 +3070,7 @@ class OrdinaryReleaseBatchRepository:
         self.release_calls = []
         self.release_interrupted = False
         self.release_completed = False
+        self.release_finished = asyncio.Event()
         self.caller_task = None
 
     def _records(self, phase):
@@ -3097,9 +3098,12 @@ class OrdinaryReleaseBatchRepository:
     async def _release(self, task_id, **_kwargs):
         self.release_calls.append(task_id)
         self.release_started.set()
-        if self.outcome == "same_tick":
+        if self.outcome in {"same_tick", "same_tick_self_cancel"}:
             assert self.caller_task is not None
             self.caller_task.cancel("same tick cancellation")
+            if self.outcome == "same_tick_self_cancel":
+                self.release_finished.set()
+                raise asyncio.CancelledError("ordinary release cancelled itself")
             self.release_completed = True
             return True
         try:
@@ -3110,6 +3114,7 @@ class OrdinaryReleaseBatchRepository:
         if self.outcome == "failure":
             raise RuntimeError("ordinary release unavailable")
         if self.outcome == "self_cancel":
+            self.release_finished.set()
             raise asyncio.CancelledError("ordinary release cancelled itself")
         self.release_completed = True
         return True
@@ -3238,3 +3243,90 @@ async def test_repeated_outer_cancellation_keeps_one_ordinary_release(phase, mon
     repo.release_gate.set()
     await _wait_for_compensation_tasks_to_clear(service)
     assert repo.release_completed is True
+
+
+@pytest.mark.asyncio
+async def test_inner_ordinary_release_cancellation_does_not_kill_poller(caplog):
+    repo = OrdinaryReleaseBatchRepository(phase="poll", outcome="self_cancel")
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", FakeDriver(error=RuntimeError("poll failed")))
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    try:
+        with caplog.at_level(logging.ERROR):
+            await service.start()
+            await repo.release_started.wait()
+            repo.release_gate.set()
+            await repo.release_finished.wait()
+            await asyncio.sleep(0)
+
+        assert service._task is not None
+        assert not service._task.done()
+        assert repo.release_calls == ["task-1"]
+        release_logs = [record for record in caplog.records if "MCP task batch release failed" in record.message]
+        assert len(release_logs) == 1
+        assert "release poll retry" in release_logs[0].message
+        assert "task_id=task-1" in release_logs[0].message
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_terminal_ordinary_release_cancellation_is_consumed_once(caplog):
+    service = McpTaskService(
+        repository=SimpleNamespace(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    state = service_module._BatchRecordState(_claimed_row())
+    task = asyncio.get_running_loop().create_future()
+    task.set_exception(asyncio.CancelledError("ordinary release cancelled itself"))
+    state.ordinary_release_task = task
+    token = service_module._current_batch_record.set(state)
+    try:
+        with caplog.at_level(logging.ERROR):
+            await service._release_ordinary_batch_record(
+                state.record,
+                release=AsyncMock(),
+                action="release poll retry",
+            )
+    finally:
+        service_module._current_batch_record.reset(token)
+
+    assert state.ordinary_release_terminal is True
+    release_logs = [record for record in caplog.records if "MCP task batch release failed" in record.message]
+    assert len(release_logs) == 1
+    assert "release poll retry" in release_logs[0].message
+    assert "task_id=task-1" in release_logs[0].message
+
+
+@pytest.mark.asyncio
+async def test_same_tick_outer_cancellation_wins_over_inner_ordinary_release(caplog):
+    repo = OrdinaryReleaseBatchRepository(phase="poll", outcome="same_tick_self_cancel")
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", FakeDriver(error=RuntimeError("poll failed")))
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    caller = asyncio.create_task(_run_batch_probe(service, "poll"))
+    repo.caller_task = caller
+
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError) as caught:
+        await caller
+
+    assert caught.value.args == ("same tick cancellation",)
+    assert repo.release_calls == ["task-1"]
+    assert repo.release_finished.is_set()
+    assert not service._compensation_tasks
