@@ -41,14 +41,10 @@ _CANCELLATION_DRAIN_TIMEOUT_SECONDS = 5.0
 @dataclass(slots=True)
 class _BatchRecordState:
     record: dict[str, Any]
-    release_started: bool = False
-    ordinary_release_handled: bool = False
-
-    def claim_release(self) -> bool:
-        if self.release_started:
-            return False
-        self.release_started = True
-        return True
+    ordinary_release_task: asyncio.Future[Any] | None = None
+    ordinary_release_terminal: bool = False
+    cancellation_release_task: asyncio.Future[Any] | None = None
+    cancellation_release_terminal: bool = False
 
 
 @dataclass(slots=True)
@@ -122,16 +118,92 @@ class McpTaskService:
     def tracking_degraded_after_errors(self) -> int:
         return self._tracking_degraded_after_errors
 
-    @staticmethod
-    def _claim_batch_ordinary_release() -> bool:
+    def _observe_batch_release_task(
+        self,
+        state: _BatchRecordState,
+        task: asyncio.Future[Any],
+        *,
+        ordinary: bool,
+        action: str,
+    ) -> None:
+        terminal_field = "ordinary_release_terminal" if ordinary else "cancellation_release_terminal"
+        if getattr(state, terminal_field) or not task.done():
+            return
+        setattr(state, terminal_field, True)
+        error = _consume_task_error(task)
+        if error is None:
+            return
+        logger.error(
+            "MCP task batch release failed (%s, task_id=%s): %s",
+            action,
+            state.record.get("id"),
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
+    def _track_batch_release_task(
+        self,
+        state: _BatchRecordState,
+        task: asyncio.Future[Any],
+        *,
+        ordinary: bool,
+        action: str,
+    ) -> None:
+        task.add_done_callback(
+            lambda completed: self._observe_batch_release_task(
+                state,
+                completed,
+                ordinary=ordinary,
+                action=action,
+            )
+        )
+
+    async def _release_ordinary_batch_record(
+        self,
+        record: dict[str, Any],
+        *,
+        release: Callable[[], Awaitable[Any]],
+        action: str,
+    ) -> None:
         state = _current_batch_record.get()
         if state is None:
-            return False
-        if state.release_started:
-            return True
-        state.ordinary_release_handled = True
-        state.release_started = True
-        return False
+            await release()
+            return
+
+        if state.cancellation_release_task is not None:
+            self._observe_batch_release_task(
+                state,
+                state.cancellation_release_task,
+                ordinary=False,
+                action="cancellation release",
+            )
+            return
+
+        task = state.ordinary_release_task
+        if task is None:
+            task = asyncio.create_task(
+                release(),
+                name=f"mcp-{action.replace(' ', '-')}-ordinary-release-{record.get('id', 'unknown')}",
+            )
+            state.ordinary_release_task = task
+            self._track_batch_release_task(
+                state,
+                task,
+                ordinary=True,
+                action=action,
+            )
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            self._observe_batch_release_task(state, task, ordinary=True, action=action)
+            if task.cancelled() and not asyncio.current_task().cancelling():
+                return
+            raise
+        except Exception:
+            self._observe_batch_release_task(state, task, ordinary=True, action=action)
+            raise
+        else:
+            self._observe_batch_release_task(state, task, ordinary=True, action=action)
 
     async def submit(
         self,
@@ -320,21 +392,51 @@ class McpTaskService:
         *,
         release: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
-        if not state.claim_release():
-            return
-        try:
-            await release(state.record)
-        except asyncio.CancelledError as exc:
-            logger.error(
-                "MCP task batch cancellation release was cancelled (task_id=%s): %s",
-                state.record.get("id"),
-                exc,
-                exc_info=(type(exc), exc, exc.__traceback__),
+        ordinary_task = state.ordinary_release_task
+        if ordinary_task is not None:
+            self._observe_batch_release_task(
+                state,
+                ordinary_task,
+                ordinary=True,
+                action="ordinary retry release",
             )
-        except Exception:  # noqa: BLE001 - preserve the child's cancellation
-            logger.exception(
-                "Unexpected MCP task batch cancellation release failure (task_id=%s)",
-                state.record.get("id"),
+            return
+
+        task = state.cancellation_release_task
+        if task is None:
+            task = asyncio.create_task(
+                release(state.record),
+                name=f"mcp-cancellation-release-{state.record.get('id', 'unknown')}",
+            )
+            state.cancellation_release_task = task
+            self._track_batch_release_task(
+                state,
+                task,
+                ordinary=False,
+                action="cancellation release",
+            )
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            self._observe_batch_release_task(
+                state,
+                task,
+                ordinary=False,
+                action="cancellation release",
+            )
+        except Exception:
+            self._observe_batch_release_task(
+                state,
+                task,
+                ordinary=False,
+                action="cancellation release",
+            )
+        else:
+            self._observe_batch_release_task(
+                state,
+                task,
+                ordinary=False,
+                action="cancellation release",
             )
 
     async def _finish_cancelled_batch(
@@ -350,7 +452,19 @@ class McpTaskService:
         # all of them in this frame lets a timed-out handoff finish safely in
         # the background without starting a second release.
         async def release_uncompleted(state: _BatchRecordState) -> None:
-            if state.ordinary_release_handled:
+            if state.ordinary_release_task is not None:
+                try:
+                    await state.ordinary_release_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                self._observe_batch_release_task(
+                    state,
+                    state.ordinary_release_task,
+                    ordinary=True,
+                    action="ordinary retry release",
+                )
                 return
             await self._release_owned_batch_record(state, release=release)
 
@@ -596,13 +710,16 @@ class McpTaskService:
             attempts = max(0, int(record.get("cancel_attempt_count") or 1) - 1)
             retry_seconds = min(self._poll_interval_seconds * (2 ** min(attempts, 16)), self._max_poll_backoff_seconds)
             failed_at = datetime.now(UTC)
-            if self._claim_batch_ordinary_release():
-                return
-            await self._repository.release_cancel_claim(
-                record["id"],
-                lease_owner=self._lease_owner,
-                next_cancel_at=failed_at + timedelta(seconds=retry_seconds),
-                error=_bound_error(str(exc) or type(exc).__name__),
+            retry_error = _bound_error(str(exc) or type(exc).__name__)
+            await self._release_ordinary_batch_record(
+                record,
+                release=lambda: self._repository.release_cancel_claim(
+                    record["id"],
+                    lease_owner=self._lease_owner,
+                    next_cancel_at=failed_at + timedelta(seconds=retry_seconds),
+                    error=retry_error,
+                ),
+                action="release cancel retry",
             )
 
     async def _run_notifications(self, *, now: datetime) -> None:
@@ -727,26 +844,32 @@ class McpTaskService:
             )
             return
         except ConflictError as exc:
-            if self._claim_batch_ordinary_release():
-                return
-            await self._repository.release_notification_claim(
-                task_id,
-                lease_owner=self._lease_owner,
-                next_notification_at=now + timedelta(seconds=self._poll_interval_seconds),
-                error=_bound_error(str(exc)),
-                replace_with_latest=True,
+            retry_error = _bound_error(str(exc))
+            await self._release_ordinary_batch_record(
+                record,
+                release=lambda: self._repository.release_notification_claim(
+                    task_id,
+                    lease_owner=self._lease_owner,
+                    next_notification_at=now + timedelta(seconds=self._poll_interval_seconds),
+                    error=retry_error,
+                    replace_with_latest=True,
+                ),
+                action="release notification conflict retry",
             )
             return
         except Exception as exc:  # noqa: BLE001 - retry the same idempotency key
-            if self._claim_batch_ordinary_release():
-                return
-            await self._repository.release_notification_claim(
-                task_id,
-                lease_owner=self._lease_owner,
-                next_notification_at=now + timedelta(seconds=self._notification_retry_seconds(record)),
-                error=_bound_error(str(exc) or type(exc).__name__),
-                replace_with_latest=True,
-                count_failure=True,
+            retry_error = _bound_error(str(exc) or type(exc).__name__)
+            await self._release_ordinary_batch_record(
+                record,
+                release=lambda: self._repository.release_notification_claim(
+                    task_id,
+                    lease_owner=self._lease_owner,
+                    next_notification_at=now + timedelta(seconds=self._notification_retry_seconds(record)),
+                    error=retry_error,
+                    replace_with_latest=True,
+                    count_failure=True,
+                ),
+                action="release notification retry",
             )
             return
         await self._repository.mark_notification_dispatched(
@@ -949,12 +1072,14 @@ class McpTaskService:
         driver_name = str(record.get("driver_name") or "")
         driver = self._drivers.get(driver_name)
         if driver is None:
-            if self._claim_batch_ordinary_release():
-                return
-            await self._release_after_error(
+            await self._release_ordinary_batch_record(
                 record,
-                now=now,
-                error=f"No MCP task driver registered as {driver_name!r}",
+                release=lambda: self._release_after_error(
+                    record,
+                    now=now,
+                    error=f"No MCP task driver registered as {driver_name!r}",
+                ),
+                action="release poll retry",
             )
             return
 
@@ -981,9 +1106,16 @@ class McpTaskService:
                 driver_name,
                 exc_info=True,
             )
-            if self._claim_batch_ordinary_release():
-                return
-            await self._release_after_error(record, now=polled_at, error=str(exc) or type(exc).__name__)
+            retry_error = str(exc) or type(exc).__name__
+            await self._release_ordinary_batch_record(
+                record,
+                release=lambda: self._release_after_error(
+                    record,
+                    now=polled_at,
+                    error=retry_error,
+                ),
+                action="release poll retry",
+            )
             return
 
         polled_at = datetime.now(UTC)
