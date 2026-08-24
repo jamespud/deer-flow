@@ -43,21 +43,28 @@ async def test_wait_for_task_until_zero_budget_returns_immediately():
 
 
 @pytest.mark.anyio
-async def test_wait_for_task_until_repeated_cancellation_keeps_original_deadline():
+async def test_wait_for_task_until_repeated_cancellation_keeps_original_deadline(monkeypatch):
+    loop = asyncio.get_running_loop()
+    clock = iter((0.0, 0.01, 0.02, 0.05))
+    monkeypatch.setattr(loop, "time", lambda: next(clock, 0.05))
+
+    wait_timeouts = []
+
+    async def fake_wait(tasks, *, timeout):
+        del tasks
+        wait_timeouts.append(timeout)
+        if len(wait_timeouts) < 3:
+            raise asyncio.CancelledError
+        return set(), set()
+
+    monkeypatch.setattr(asyncio, "wait", fake_wait)
     event = asyncio.Event()
     child = asyncio.create_task(event.wait())
-    deadline = asyncio.get_running_loop().time() + 0.05
-    waiter = asyncio.create_task(wait_for_task_until(child, deadline=deadline))
 
-    await asyncio.sleep(0)
-    waiter.cancel()
-    await asyncio.sleep(0.02)
-    waiter.cancel()
-
-    completed = await asyncio.wait_for(waiter, timeout=0.2)
+    completed = await wait_for_task_until(child, deadline=0.05)
 
     assert completed is False
-    assert asyncio.get_running_loop().time() < deadline + 0.1
+    assert wait_timeouts == pytest.approx([0.05, 0.04, 0.03])
     assert child.done() is False
     event.set()
     await child
