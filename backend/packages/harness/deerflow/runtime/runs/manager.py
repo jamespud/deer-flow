@@ -493,6 +493,21 @@ class RunManager:
         task.add_done_callback(self._shutdown_persistence_done)
         return task
 
+    @staticmethod
+    def _observe_completed_run_task_exceptions(
+        run_tasks: list[asyncio.Task | None],
+    ) -> None:
+        """Consume terminal exceptions without mutating run state."""
+        for task in run_tasks:
+            if task is None or not task.done() or task.cancelled():
+                continue
+            try:
+                task.exception()
+            except BaseException:
+                # Retrieving an exception is best effort and must never replace
+                # shutdown's own cancellation or deadline outcome.
+                pass
+
     def _index_run_locked(self, record: RunRecord) -> None:
         """Register *record* in the thread index. Caller must hold ``self._lock``."""
         self._runs_by_thread.setdefault(record.thread_id, {})[record.run_id] = None
@@ -2605,15 +2620,16 @@ class RunManager:
         # own (still pending after the timeout, or ended cancelled). A run that
         # finished normally during the drain keeps the status it set for itself.
         to_persist: list[RunRecord] = []
-        post_wait_lock_acquired = await self._acquire_lock_until(deadline)
+        post_wait_lock_acquired = False
+        try:
+            post_wait_lock_acquired = await self._acquire_lock_until(deadline)
+        finally:
+            self._observe_completed_run_task_exceptions(run_tasks)
         if post_wait_lock_acquired:
             try:
                 for record in inflight:
                     task = record.task
                     if task not in pending_run_tasks and not task.cancelled():
-                        # Completed on its own — retrieve any surfaced exception so it
-                        # is not reported as "never retrieved", and keep its status.
-                        task.exception()  # type: ignore[union-attr]  # done & not cancelled
                         continue
                     if record.status in (RunStatus.pending, RunStatus.running):
                         record.status = RunStatus.interrupted

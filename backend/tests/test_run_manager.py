@@ -737,6 +737,108 @@ async def test_shutdown_bounds_post_wait_manager_lock_wait(caplog: pytest.LogCap
 
 
 @pytest.mark.anyio
+async def test_shutdown_observes_completed_run_after_post_wait_lock_timeout():
+    store = MemoryRunStore()
+    manager = RunManager(store=store)
+    run_started = asyncio.Event()
+    holder_started = asyncio.Event()
+    release_holder = asyncio.Event()
+    holder_task: asyncio.Task[None] | None = None
+
+    async def hold_lock() -> None:
+        await manager._lock.acquire()
+        holder_started.set()
+        await release_holder.wait()
+        manager._lock.release()
+
+    async def run() -> None:
+        nonlocal holder_task
+        run_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            holder_task = asyncio.create_task(hold_lock())
+            await holder_started.wait()
+            raise RuntimeError("run failed during shutdown")
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    await run_started.wait()
+
+    try:
+        await asyncio.wait_for(manager.shutdown(timeout=0.03), timeout=0.2)
+        assert record.task.done()
+        assert getattr(record.task, "_log_traceback", True) is False
+        assert record.status == RunStatus.pending
+        stored = await store.get(record.run_id)
+        assert stored is not None
+        assert stored["status"] == RunStatus.pending.value
+    finally:
+        release_holder.set()
+        if holder_task is not None:
+            await holder_task
+
+
+@pytest.mark.anyio
+async def test_shutdown_cancellation_observes_completed_run_during_post_wait_lock():
+    store = MemoryRunStore()
+    manager = RunManager(store=store)
+    run_started = asyncio.Event()
+    holder_started = asyncio.Event()
+    release_holder = asyncio.Event()
+    second_lock_wait_started = asyncio.Event()
+    holder_task: asyncio.Task[None] | None = None
+    acquire_calls = 0
+    original_acquire = manager._acquire_lock_until
+
+    async def observe_second_lock_wait(deadline: float) -> bool:
+        nonlocal acquire_calls
+        acquire_calls += 1
+        if acquire_calls == 2:
+            second_lock_wait_started.set()
+        return await original_acquire(deadline)
+
+    async def hold_lock() -> None:
+        await manager._lock.acquire()
+        holder_started.set()
+        await release_holder.wait()
+        manager._lock.release()
+
+    async def run() -> None:
+        nonlocal holder_task
+        run_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            holder_task = asyncio.create_task(hold_lock())
+            await holder_started.wait()
+            raise RuntimeError("run failed during shutdown cancellation")
+
+    manager._acquire_lock_until = observe_second_lock_wait
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    await run_started.wait()
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=1.0))
+
+    try:
+        await asyncio.wait_for(second_lock_wait_started.wait(), timeout=0.2)
+        shutdown_task.cancel("caller cancelled shutdown")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await shutdown_task
+        assert caught.value.args == ("caller cancelled shutdown",)
+        assert record.task.done()
+        assert getattr(record.task, "_log_traceback", True) is False
+        assert record.status == RunStatus.pending
+        stored = await store.get(record.run_id)
+        assert stored is not None
+        assert stored["status"] == RunStatus.pending.value
+    finally:
+        release_holder.set()
+        if holder_task is not None:
+            await holder_task
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("late_failure", [False, True], ids=["success", "failure"])
 async def test_shutdown_supervises_late_status_persistence_without_cancelling_or_retrying(
     monkeypatch: pytest.MonkeyPatch,
