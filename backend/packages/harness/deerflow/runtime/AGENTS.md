@@ -145,14 +145,21 @@ PYTHONPATH=. uv run python scripts/benchmark/checkpoint/summarize_production.py 
 
 ### Bounded Cancellation Drains
 
-Cancellation-safe runtime boundaries use one fixed 5.0-second monotonic drain
-budget (`loop.time()`). Repeated caller cancellation is absorbed while the
-same absolute deadline remains in force; cancellation never renews the wait.
-When an operation is still ambiguous at the deadline, the current task raises
-its original cancellation and transfers ownership of that same task to one
-supervised background registry. The background owner consumes the eventual
-success, failure, or cancellation exactly once. It must not blindly retry or
-requeue an operation whose durable outcome is unknown.
+Source map (paths relative to `backend/`): `runtime/cancellation.py` owns shared
+drain predicates and waits; `app/mcp_tasks/service.py` owns MCP claim, batch,
+release, and stop handoffs; `runtime/journal.py` owns event-store writes; and
+`runtime/runs/manager.py` owns run cancellation, finalization, and shutdown.
+
+Each boundary currently uses a fixed internal five-second monotonic deadline
+(`loop.time()`); the constants remain module-local. Repeated caller
+cancellation is absorbed while the same absolute deadline remains in force;
+cancellation never renews the wait. When caller-cancellation draining times out:
+the exact asyncio operation task remains retained by the subsystem-owned registry after timeout.
+The original `CancelledError` is re-raised, while
+normal `McpTaskService.stop()` and `RunManager.shutdown()` record/log the
+deadline and return as retained work continues. The retained owner consumes the
+eventual success, failure, or cancellation exactly once; it must not blindly
+retry or requeue an operation whose durable outcome is unknown.
 
 RunManager applies its caller-provided shutdown hard total budget across
 cancellation-cleanup producers, manager-lock waiters, in-flight run
@@ -176,11 +183,12 @@ predicate: a self-cancelled claim is consumed only when no caller cancellation
 is pending, otherwise the caller's cancellation wins. Notification cancellation
 does not enter ordinary retry handling. The supervisor task, every child task,
 and every ordinary or cancellation release task are retrieved and their
-terminal success, failure, or cancellation is consumed exactly once. Release,
-supervisor, and background-ownership failures receive one contextual log; child
-failures may be aggregated and logged as unexpected failures at the batch
-boundary rather than individually. Successful completion clears task ownership
-without emitting a second log.
+terminal success, failure, or cancellation is consumed exactly once. Poll,
+cancellation, and notification batch results are observed and recorded at the
+per-record boundary; unexpected child failures are logged with that record's
+task ID, and notification failures enter that record's release handling.
+Supervisor, release, and background-ownership failures receive one contextual
+log. Successful completion clears task ownership without emitting a second log.
 
 `McpTaskService.stop()` establishes one absolute `loop.time()` deadline for the
 poller cleanup. Repeated or concurrent `stop()` calls reuse that deadline and
@@ -198,7 +206,7 @@ predecessor. A later flush that is itself cancelled only observes predecessors
 through its bounded drain deadline. A successful write is discarded from the
 detached registry; a late explicit failure or self-cancellation prepends its
 batch exactly once. No automatic retry is launched. If the write remains
-ambiguous after the fixed drain budget, ownership stays with its supervised
+ambiguous after its drain deadline, ownership stays with its supervised
 background task until the final result, so a JSONL `to_thread` append or
 database commit cannot be duplicated by a blind retry. If a scheduled flush is
 cancelled before its first coroutine step, its completion callback restores the
