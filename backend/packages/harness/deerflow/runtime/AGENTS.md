@@ -155,8 +155,9 @@ success, failure, or cancellation exactly once. It must not blindly retry or
 requeue an operation whose durable outcome is unknown.
 
 RunManager applies its caller-provided shutdown hard total budget across
-cancellation-cleanup producers, manager-lock waiters, in-flight run cancellation, heartbeat stop, orphan
-recovery, and trailing interrupted-status persistence. Lock waiters are
+cancellation-cleanup producers, manager-lock waiters, in-flight run
+cancellation, heartbeat stop, orphan recovery, and trailing interrupted-status
+persistence. Lock waiters are
 cancelled once, tracked until a late result arrives, and release the manager
 lock at most once if they acquire it after the foreground deadline. Heartbeat
 and orphan tasks keep one background owner after a timed-out stop, while late
@@ -173,18 +174,31 @@ cancellation keeps its original signal and releases the whole batch without
 duplicating child cleanup. Claim cancellation uses the same inner-vs-outer
 predicate: a self-cancelled claim is consumed only when no caller cancellation
 is pending, otherwise the caller's cancellation wins. Notification cancellation
-does not enter ordinary retry handling.
+does not enter ordinary retry handling. The supervisor task, every child task,
+and every ordinary or cancellation release task are retrieved and their
+terminal success, failure, or cancellation is consumed exactly once. Failures
+receive one contextual log; successful completion clears task ownership without
+emitting a second log.
+
+`McpTaskService.stop()` establishes one absolute `loop.time()` deadline for the
+poller cleanup. Repeated or concurrent `stop()` calls reuse that deadline and
+do not recancel the same poller. If the deadline expires, the poller remains
+supervised in the background; `start()` will not create an overlapping poller
+while that owner is still live.
 
 ### Cancellation-Safe Run Journal Writes
 
 `RunJournal` transfers each detached batch to a dedicated `put_batch` task and
 shields that task from caller cancellation. Threshold flushes and the worker's
 final explicit `flush()` serialize all pending and detached predecessors before
-starting a later write. A successful write is never requeued; a confirmed write
-failure restores the batch ahead of newer buffered events. If the write remains
+starting a later write; a normal, uncancelled flush may wait for that serialized
+predecessor. A later flush that is itself cancelled only observes predecessors
+through its bounded drain deadline. A successful write is discarded from the
+detached registry; a late explicit failure or self-cancellation prepends its
+batch exactly once. No automatic retry is launched. If the write remains
 ambiguous after the fixed drain budget, ownership stays with its supervised
-background task until the final result, so a JSONL `to_thread` append or database
-commit cannot be duplicated by a blind retry. If a scheduled flush is cancelled
-before its first coroutine step, its completion callback restores the still-
-unowned detached batch instead. Do not reintroduce a direct
+background task until the final result, so a JSONL `to_thread` append or
+database commit cannot be duplicated by a blind retry. If a scheduled flush is
+cancelled before its first coroutine step, its completion callback restores the
+still-unowned detached batch instead. Do not reintroduce a direct
 `except CancelledError: requeue` around event-store writes.
