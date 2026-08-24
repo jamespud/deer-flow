@@ -143,17 +143,48 @@ PYTHONPATH=. uv run python scripts/benchmark/checkpoint/summarize_production.py 
   /tmp/production-bench.jsonl
 ```
 
+### Bounded Cancellation Drains
+
+Cancellation-safe runtime boundaries use one fixed 5.0-second monotonic drain
+budget (`loop.time()`). Repeated caller cancellation is absorbed while the
+same absolute deadline remains in force; cancellation never renews the wait.
+When an operation is still ambiguous at the deadline, the current task raises
+its original cancellation and transfers ownership of that same task to one
+supervised background registry. The background owner consumes the eventual
+success, failure, or cancellation exactly once. It must not blindly retry or
+requeue an operation whose durable outcome is unknown.
+
+RunManager applies its caller-provided shutdown hard total budget across
+cancellation-cleanup producers, manager-lock waiters, in-flight run cancellation, heartbeat stop, orphan
+recovery, and trailing interrupted-status persistence. Lock waiters are
+cancelled once, tracked until a late result arrives, and release the manager
+lock at most once if they acquire it after the foreground deadline. Heartbeat
+and orphan tasks keep one background owner after a timed-out stop, while late
+failures are consumed once. Shutdown preserves a run's real final outcome when
+it settles during the drain and only marks/persists `interrupted` for work that
+did not settle.
+
+MCP claimed batches run under a shielded supervisor. Each record has one
+release state and sibling release tasks start concurrently, so started and
+never-started records are released exactly once. Ordinary retry release and
+cancellation release are mutually exclusive. Inner self-cancellation is
+consumed and logged at the task boundary without killing the poller; an outer
+cancellation keeps its original signal and releases the whole batch without
+duplicating child cleanup. Claim cancellation uses the same inner-vs-outer
+predicate: a self-cancelled claim is consumed only when no caller cancellation
+is pending, otherwise the caller's cancellation wins. Notification cancellation
+does not enter ordinary retry handling.
+
 ### Cancellation-Safe Run Journal Writes
 
 `RunJournal` transfers each detached batch to a dedicated `put_batch` task and
-shields that task from caller cancellation. If the caller is cancelled, the
-journal drains the write through repeated cancellation before deciding whether
-the batch still belongs in memory: a successful write is never requeued, while
-a confirmed write failure restores the batch ahead of newer buffered events. If
-the scheduled flush is cancelled before its first coroutine step, its completion
-callback restores the still-unowned detached batch instead.
-This boundary applies to both threshold-triggered background flushes and the
-worker's final explicit `flush()`. Do not reintroduce a direct
-`except CancelledError: requeue` around event-store writes; JSONL `to_thread`
-appends and database commits can finish after their caller observes cancellation,
-which would duplicate an already-persisted batch on retry.
+shields that task from caller cancellation. Threshold flushes and the worker's
+final explicit `flush()` serialize all pending and detached predecessors before
+starting a later write. A successful write is never requeued; a confirmed write
+failure restores the batch ahead of newer buffered events. If the write remains
+ambiguous after the fixed drain budget, ownership stays with its supervised
+background task until the final result, so a JSONL `to_thread` append or database
+commit cannot be duplicated by a blind retry. If a scheduled flush is cancelled
+before its first coroutine step, its completion callback restores the still-
+unowned detached batch instead. Do not reintroduce a direct
+`except CancelledError: requeue` around event-store writes.
