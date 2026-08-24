@@ -511,6 +511,275 @@ class TestBufferFlush:
         assert store.write_cancelled is False
         assert [event["event_type"] for event in journal._buffer] == ["run.delivery"]
 
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("eventual_error", [False, True], ids=["late-success", "late-failure"])
+    async def test_cancelled_hung_write_transfers_ownership_without_blind_requeue(self, monkeypatch, caplog, eventual_error):
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+        class HangingStore:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.finish = asyncio.Event()
+                self.calls = 0
+                self.cancelled = False
+
+            async def put_batch(self, _batch):
+                self.calls += 1
+                self.started.set()
+                try:
+                    await self.finish.wait()
+                except asyncio.CancelledError:
+                    self.cancelled = True
+                    raise
+                if eventual_error:
+                    raise RuntimeError("journal write failed late")
+                return []
+
+        store = HangingStore()
+        journal = RunJournal("r1", "t1", store, flush_threshold=100)
+        journal.record_delivery()
+        flush_task = asyncio.create_task(journal.flush())
+        try:
+            await store.started.wait()
+            flush_task.cancel()
+
+            done, _ = await asyncio.wait({flush_task}, timeout=0.2)
+            assert flush_task in done
+            result = await asyncio.gather(flush_task, return_exceptions=True)
+            assert isinstance(result[0], asyncio.CancelledError)
+            assert journal._buffer == []
+            assert len(journal._detached_write_tasks) == 1
+            assert store.calls == 1
+            assert store.cancelled is False
+
+            store.finish.set()
+            detached = tuple(journal._detached_write_tasks)
+            await asyncio.gather(*detached, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert journal._detached_write_tasks == {}
+            if eventual_error:
+                assert len(journal._buffer) == 1
+                assert sum("Detached journal write failed" in record.message for record in caplog.records) == 1
+            else:
+                assert journal._buffer == []
+        finally:
+            store.finish.set()
+            await asyncio.gather(flush_task, return_exceptions=True)
+            detached = tuple(getattr(journal, "_detached_write_tasks", ()))
+            if detached:
+                await asyncio.gather(*detached, return_exceptions=True)
+
+    @pytest.mark.anyio
+    async def test_eventual_underlying_write_cancellation_requeues_once(self, monkeypatch, caplog):
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+        class SelfCancellingStore:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.finish = asyncio.Event()
+                self.calls = 0
+
+            async def put_batch(self, _batch):
+                self.calls += 1
+                self.started.set()
+                await self.finish.wait()
+                raise asyncio.CancelledError
+
+        store = SelfCancellingStore()
+        journal = RunJournal("r1", "t1", store, flush_threshold=100)
+        journal.record_delivery()
+        flush_task = asyncio.create_task(journal.flush())
+        try:
+            await store.started.wait()
+            flush_task.cancel()
+            done, _ = await asyncio.wait({flush_task}, timeout=0.2)
+            assert flush_task in done
+            result = await asyncio.gather(flush_task, return_exceptions=True)
+            assert isinstance(result[0], asyncio.CancelledError)
+            assert journal._buffer == []
+            assert len(journal._detached_write_tasks) == 1
+
+            store.finish.set()
+            detached = tuple(journal._detached_write_tasks)
+            await asyncio.gather(*detached, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert journal._detached_write_tasks == {}
+            assert len(journal._buffer) == 1
+            assert sum("Detached journal write failed" in record.message for record in caplog.records) == 1
+            assert store.calls == 1
+        finally:
+            store.finish.set()
+            await asyncio.gather(flush_task, return_exceptions=True)
+            detached = tuple(getattr(journal, "_detached_write_tasks", ()))
+            if detached:
+                await asyncio.gather(*detached, return_exceptions=True)
+
+    @pytest.mark.anyio
+    async def test_detached_write_serializes_threshold_and_explicit_flushes(self, monkeypatch):
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+        class CountingStore:
+            def __init__(self):
+                self.calls = 0
+                self.first_started = asyncio.Event()
+                self.first_finish = asyncio.Event()
+                self.second_started = asyncio.Event()
+                self.second_finish = asyncio.Event()
+
+            async def put_batch(self, _batch):
+                self.calls += 1
+                if self.calls == 1:
+                    self.first_started.set()
+                    await self.first_finish.wait()
+                else:
+                    self.second_started.set()
+                    await self.second_finish.wait()
+                return []
+
+        store = CountingStore()
+        journal = RunJournal("r1", "t1", store, flush_threshold=100)
+        journal.record_delivery()
+        first_flush = asyncio.create_task(journal.flush())
+        try:
+            await store.first_started.wait()
+            first_flush.cancel()
+            done, _ = await asyncio.wait({first_flush}, timeout=0.2)
+            assert first_flush in done
+            first_result = await asyncio.gather(first_flush, return_exceptions=True)
+            assert isinstance(first_result[0], asyncio.CancelledError)
+            assert len(journal._detached_write_tasks) == 1
+
+            journal.record_delivery()
+            journal._flush_sync()
+            await asyncio.sleep(0)
+            assert store.calls == 1
+            assert len(journal._buffer) == 1
+
+            later_flush = asyncio.create_task(journal.flush())
+            await asyncio.sleep(0)
+            assert store.calls == 1
+
+            store.first_finish.set()
+            await asyncio.wait_for(store.second_started.wait(), timeout=0.2)
+            assert store.calls == 2
+            store.second_finish.set()
+            await later_flush
+            assert journal._detached_write_tasks == {}
+            assert journal._buffer == []
+        finally:
+            store.first_finish.set()
+            store.second_finish.set()
+            await asyncio.gather(first_flush, return_exceptions=True)
+            if "later_flush" in locals():
+                await asyncio.gather(later_flush, return_exceptions=True)
+            detached = tuple(getattr(journal, "_detached_write_tasks", ()))
+            if detached:
+                await asyncio.gather(*detached, return_exceptions=True)
+
+    @pytest.mark.anyio
+    async def test_later_flush_cancellation_keeps_detached_predecessor_and_does_not_overtake(self, monkeypatch):
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+        class BlockingStore:
+            def __init__(self):
+                self.calls = 0
+                self.started = asyncio.Event()
+                self.finish = asyncio.Event()
+
+            async def put_batch(self, _batch):
+                self.calls += 1
+                self.started.set()
+                await self.finish.wait()
+                return []
+
+        store = BlockingStore()
+        journal = RunJournal("r1", "t1", store, flush_threshold=100)
+        journal.record_delivery()
+        first_flush = asyncio.create_task(journal.flush())
+        later_flush = None
+        try:
+            await store.started.wait()
+            first_flush.cancel()
+            done, _ = await asyncio.wait({first_flush}, timeout=0.2)
+            assert first_flush in done
+            first_result = await asyncio.gather(first_flush, return_exceptions=True)
+            assert isinstance(first_result[0], asyncio.CancelledError)
+            assert len(journal._detached_write_tasks) == 1
+
+            journal.record_delivery()
+            later_flush = asyncio.create_task(journal.flush())
+            await asyncio.sleep(0)
+            later_flush.cancel()
+            done, _ = await asyncio.wait({later_flush}, timeout=0.2)
+            assert later_flush in done
+            later_result = await asyncio.gather(later_flush, return_exceptions=True)
+            assert isinstance(later_result[0], asyncio.CancelledError)
+            assert store.calls == 1
+            assert len(journal._detached_write_tasks) == 1
+            assert len(journal._buffer) == 1
+        finally:
+            store.finish.set()
+            await asyncio.gather(first_flush, return_exceptions=True)
+            if later_flush is not None:
+                await asyncio.gather(later_flush, return_exceptions=True)
+            detached = tuple(getattr(journal, "_detached_write_tasks", ()))
+            if detached:
+                await asyncio.gather(*detached, return_exceptions=True)
+
+    @pytest.mark.anyio
+    async def test_journal_write_cancellation_uses_one_absolute_drain_deadline(self, monkeypatch):
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+        observed_deadlines = []
+        real_wait_for_task_until = journal_module.wait_for_task_until
+
+        async def recording_wait(task, *, deadline):
+            observed_deadlines.append(deadline)
+            return await real_wait_for_task_until(task, deadline=deadline)
+
+        monkeypatch.setattr(journal_module, "wait_for_task_until", recording_wait)
+
+        class StalledStore:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.finish = asyncio.Event()
+
+            async def put_batch(self, _batch):
+                self.started.set()
+                await self.finish.wait()
+                return []
+
+        store = StalledStore()
+        journal = RunJournal("r1", "t1", store, flush_threshold=100)
+        journal.record_delivery()
+        flush_task = asyncio.create_task(journal.flush())
+        try:
+            await store.started.wait()
+            flush_task.cancel()
+            await asyncio.sleep(0)
+            flush_task.cancel()
+            done, _ = await asyncio.wait({flush_task}, timeout=0.2)
+            assert flush_task in done
+            result = await asyncio.gather(flush_task, return_exceptions=True)
+            assert isinstance(result[0], asyncio.CancelledError)
+            assert len(observed_deadlines) == 1
+            assert len(journal._detached_write_tasks) == 1
+        finally:
+            store.finish.set()
+            await asyncio.gather(flush_task, return_exceptions=True)
+            detached = tuple(getattr(journal, "_detached_write_tasks", ()))
+            if detached:
+                await asyncio.gather(*detached, return_exceptions=True)
+
 
 class TestIdentifyCaller:
     def test_lead_agent_tag(self, journal_setup):

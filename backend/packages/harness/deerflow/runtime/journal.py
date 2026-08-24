@@ -31,6 +31,7 @@ from langchain_core.messages import AIMessage, AnyMessage, BaseMessage, HumanMes
 from langgraph.types import Command
 
 from deerflow.agents.human_input import read_human_input_response
+from deerflow.runtime.cancellation import wait_for_task_until
 from deerflow.runtime.events.catalog import (
     LLM_AI_RESPONSE_EVENT,
     LLM_ERROR_EVENT,
@@ -52,6 +53,7 @@ logger = logging.getLogger(__name__)
 _LEGACY_SUMMARY_MESSAGE_NAME = "summary"
 _RECONCILED_TOOL_MESSAGE_NAMES = frozenset({"ask_clarification"})
 _PERSISTED_HIDDEN_HUMAN_INPUT_RESPONSE_SOURCES = frozenset({"ask_clarification"})
+_CANCELLATION_DRAIN_TIMEOUT_SECONDS = 5.0
 
 
 @dataclass
@@ -250,6 +252,7 @@ class RunJournal(BaseCallbackHandler):
         # Write buffer
         self._buffer: list[dict] = []
         self._pending_flush_tasks: set[asyncio.Task[None]] = set()
+        self._detached_write_tasks: dict[asyncio.Future[Any], list[dict]] = {}
         self._pending_progress_task: asyncio.Task[None] | None = None
         self._pending_progress_delayed = False
         self._progress_dirty = False
@@ -668,7 +671,7 @@ class RunJournal(BaseCallbackHandler):
             return
         # Skip if a flush is already in flight — avoids concurrent writes
         # to the same SQLite file from multiple fire-and-forget tasks.
-        if self._pending_flush_tasks:
+        if self._pending_flush_tasks or self._detached_write_tasks:
             return
         try:
             loop = asyncio.get_running_loop()
@@ -688,30 +691,91 @@ class RunJournal(BaseCallbackHandler):
         try:
             await asyncio.shield(write_task)
         except asyncio.CancelledError:
-            while not write_task.done():
-                try:
-                    await asyncio.shield(write_task)
-                except asyncio.CancelledError:
-                    continue
-                except Exception:
-                    break
+            completed = await wait_for_task_until(
+                write_task,
+                deadline=asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+            )
+            if not completed:
+                self._track_detached_write(write_task, batch)
+                logger.warning(
+                    "Timed out after %.1f seconds draining journal write for run %s; %d events remain owned by the background write",
+                    _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                    self.run_id,
+                    len(batch),
+                )
+                raise
             try:
                 write_task.result()
             except asyncio.CancelledError:
                 logger.warning(
-                    "Cancelled journal write task for run %s — returning %d events to buffer",
+                    "Journal write was cancelled while draining cancellation for run %s; returning %d events to buffer",
                     self.run_id,
                     len(batch),
                 )
                 self._buffer = batch + self._buffer
-            except Exception:
+            except BaseException as error:
                 logger.warning(
                     "Journal write failed while draining cancellation for run %s — returning %d events to buffer",
                     self.run_id,
                     len(batch),
-                    exc_info=True,
+                    exc_info=(type(error), error, error.__traceback__),
                 )
                 self._buffer = batch + self._buffer
+            raise
+
+    def _track_detached_write(self, task: asyncio.Future[Any], batch: list[dict]) -> None:
+        """Keep ownership of an ambiguous write until its terminal result is known."""
+        if task in self._detached_write_tasks:
+            return
+        self._detached_write_tasks[task] = batch
+        task.add_done_callback(self._resolve_detached_write)
+
+    def _resolve_detached_write(self, task: asyncio.Future[Any]) -> None:
+        """Resolve a detached write exactly once when its task reaches a terminal state."""
+        batch = self._detached_write_tasks.pop(task, None)
+        if batch is None:
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError as exc:
+            error = exc
+        if error is None:
+            return
+        logger.warning(
+            "Detached journal write failed for run %s; returning %d events to buffer",
+            self.run_id,
+            len(batch),
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        self._buffer = batch + self._buffer
+
+    async def _await_detached_writes(self) -> None:
+        """Observe detached predecessors without cancelling them on caller cancellation."""
+        tasks = tuple(self._detached_write_tasks)
+        if not tasks:
+            return
+        try:
+            await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
+        except asyncio.CancelledError:
+            deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+            for task in tasks:
+                if await wait_for_task_until(task, deadline=deadline):
+                    self._resolve_detached_write(task)
+            raise
+        for task in tasks:
+            self._resolve_detached_write(task)
+
+    async def _await_pending_flush_tasks(self) -> None:
+        """Observe threshold flushes without letting caller cancellation cancel them."""
+        tasks = tuple(self._pending_flush_tasks)
+        if not tasks:
+            return
+        try:
+            await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
+        except asyncio.CancelledError:
+            deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+            for task in tasks:
+                await wait_for_task_until(task, deadline=deadline)
             raise
 
     async def _flush_async(self, batch: list[dict], *, detached: _DetachedFlush | None = None) -> None:
@@ -930,8 +994,8 @@ class RunJournal(BaseCallbackHandler):
 
     async def flush(self) -> None:
         """Force flush remaining buffer. Called in worker's finally block."""
-        if self._pending_flush_tasks:
-            await asyncio.gather(*tuple(self._pending_flush_tasks), return_exceptions=True)
+        await self._await_detached_writes()
+        await self._await_pending_flush_tasks()
         while self._pending_progress_task is not None and not self._pending_progress_task.done():
             if self._pending_progress_delayed:
                 self._pending_progress_task.cancel()
