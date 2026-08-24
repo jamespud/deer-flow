@@ -994,36 +994,42 @@ class RunManager:
             return None
 
         try:
-            result = await self._call_store_with_retry(
-                "finalize_if_not_cancelled",
-                run_id,
-                lambda: self._store.finalize_if_not_cancelled(
+            try:
+                result = await self._call_store_with_retry(
+                    "finalize_if_not_cancelled",
                     run_id,
-                    status=status.value,
-                    error=error,
-                    stop_reason=stop_reason,
-                ),
-            )
+                    lambda: self._store.finalize_if_not_cancelled(
+                        run_id,
+                        status=status.value,
+                        error=error,
+                        stop_reason=stop_reason,
+                    ),
+                )
+            except Exception:
+                await self._fence_unconfirmed_finalization(run_id)
+                return None
         except asyncio.CancelledError:
-            async with self._lock:
-                record = self._runs.get(run_id)
-            if record is not None:
-                await self._mark_ownership_lost(
-                    record,
-                    reason=("The durable store could not confirm whether cancellation or completion won."),
-                    require_active=False,
+            cleanup = asyncio.create_task(self._fence_unconfirmed_finalization(run_id))
+            cleanup.set_name(f"deerflow-fence-cancelled-finalization-{run_id}")
+            while not cleanup.done():
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            try:
+                cleanup.result()
+            except asyncio.CancelledError:
+                logger.error("Cancelled finalization fence task was itself cancelled for run %s", run_id)
+            except Exception as exc:  # noqa: BLE001 - preserve the caller's cancellation
+                logger.error(
+                    "Failed to fence run %s after finalization was cancelled: %s",
+                    run_id,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
                 )
             raise
-        except Exception:
-            async with self._lock:
-                record = self._runs.get(run_id)
-            if record is not None:
-                await self._mark_ownership_lost(
-                    record,
-                    reason=("The durable store could not confirm whether cancellation or completion won."),
-                    require_active=False,
-                )
-            return None
 
         if result.cancel_action is not None:
             async with self._lock:
@@ -1041,6 +1047,16 @@ class RunManager:
             persist=not result.finalized,
         )
         return None
+
+    async def _fence_unconfirmed_finalization(self, run_id: str) -> None:
+        async with self._lock:
+            record = self._runs.get(run_id)
+        if record is not None:
+            await self._mark_ownership_lost(
+                record,
+                reason="The durable store could not confirm whether cancellation or completion won.",
+                require_active=False,
+            )
 
     async def _ensure_delivery_receipt(self, record: RunRecord) -> bool:
         """Idempotently persist a zero-delivery receipt during recovery."""

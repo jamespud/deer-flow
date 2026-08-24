@@ -1422,10 +1422,16 @@ async def test_stop_cancels_a_hung_driver_poll():
 class CancellationBlockingApplyRepo(FakeRepository):
     """``apply_cancel_snapshot`` blocks so the caller can be cancelled mid-flight."""
 
-    def __init__(self):
+    def __init__(self, *, release_error: Exception | None = None, block_release: bool = False):
         super().__init__()
         self.apply_started = asyncio.Event()
         self.release_cancel_calls = []
+        self.release_error = release_error
+        self.block_release = block_release
+        self.release_started = asyncio.Event()
+        self.finish_release = asyncio.Event()
+        self.release_completed = False
+        self.release_interrupted = False
 
     async def apply_cancel_snapshot(self, task_id, **kwargs):
         self.applied.append((task_id, kwargs))
@@ -1434,6 +1440,16 @@ class CancellationBlockingApplyRepo(FakeRepository):
 
     async def release_cancel_claim(self, task_id, **kwargs):
         self.release_cancel_calls.append((task_id, kwargs))
+        self.release_started.set()
+        if self.block_release:
+            try:
+                await self.finish_release.wait()
+            except asyncio.CancelledError:
+                self.release_interrupted = True
+                raise
+        if self.release_error is not None:
+            raise self.release_error
+        self.release_completed = True
         return True
 
 
@@ -1462,3 +1478,450 @@ def test_cancel_one_releases_claim_when_cancelled():
         assert repo.release_cancel_calls[0][0] == record["id"]
 
     asyncio.run(main())
+
+
+@pytest.mark.asyncio
+async def test_cancel_one_preserves_cancellation_when_release_fails(caplog):
+    repo = CancellationBlockingApplyRepo(release_error=RuntimeError("release unavailable"))
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", FakeDriver())
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    task = asyncio.create_task(service._cancel_one(_claimed_row()))
+    await repo.apply_started.wait()
+    task.cancel()
+
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert repo.release_cancel_calls
+    assert "release unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancel_one_repeated_cancellation_does_not_interrupt_release():
+    repo = CancellationBlockingApplyRepo(block_release=True)
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", FakeDriver())
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    task = asyncio.create_task(service._cancel_one(_claimed_row()))
+    await repo.apply_started.wait()
+    task.cancel()
+    await repo.release_started.wait()
+    task.cancel()
+    repo.finish_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert repo.release_completed is True
+    assert repo.release_interrupted is False
+
+
+@pytest.mark.asyncio
+async def test_cancel_one_failure_release_retries_after_caller_cancellation():
+    repo = CancellationBlockingApplyRepo(block_release=True)
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", FakeDriver(cancel_error=RuntimeError("remote unavailable")))
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    task = asyncio.create_task(service._cancel_one(_claimed_row()))
+    await repo.release_started.wait()
+    task.cancel()
+    repo.finish_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert repo.release_completed is True
+    assert repo.release_interrupted is True
+    assert len(repo.release_cancel_calls) == 2
+
+
+class CancelAfterClaimRepository(FakeRepository):
+    def __init__(self, *, phase: str):
+        super().__init__()
+        self.phase = phase
+        self.cancel_releases = []
+        self.notification_claim_releases = []
+        self.notification_lease_releases = []
+
+    def _cancel_caller(self):
+        task = asyncio.current_task()
+        assert task is not None
+        task.cancel()
+
+    async def claim_cancel_requests(self, **_kwargs):
+        if self.phase != "cancel":
+            return []
+        self._cancel_caller()
+        return [_claimed_row()]
+
+    async def claim_due_tasks(self, **_kwargs):
+        if self.phase != "poll":
+            return []
+        self._cancel_caller()
+        return [_claimed_row()]
+
+    async def claim_notification_work(self, **_kwargs):
+        if not self.phase.startswith("notification_"):
+            return []
+        status = self.phase.removeprefix("notification_")
+        self._cancel_caller()
+        return [
+            {
+                **_claimed_row(),
+                "notification_status": status,
+                "notification_run_id": "notify-run-1" if status == "dispatched" else None,
+                "dispatch_version": 2,
+                "dispatch_attempt": 0,
+                "dispatch_event": {"status": "completed"},
+            }
+        ]
+
+    async def release_cancel_claim(self, task_id, **kwargs):
+        self.cancel_releases.append((task_id, kwargs))
+        return True
+
+    async def release_notification_claim(self, task_id, **kwargs):
+        self.notification_claim_releases.append((task_id, kwargs))
+        return True
+
+    async def release_notification_lease(self, task_id, **kwargs):
+        self.notification_lease_releases.append((task_id, kwargs))
+        return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "released_attr"),
+    [
+        ("poll", "released"),
+        ("cancel", "cancel_releases"),
+        ("notification_claimed", "notification_claim_releases"),
+        ("notification_dispatched", "notification_lease_releases"),
+    ],
+)
+async def test_cancellation_immediately_after_claim_releases_every_record(phase, released_attr):
+    repo = CancelAfterClaimRepository(phase=phase)
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", FakeDriver())
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(return_value={"run_id": "notify-run-1"}),
+        get_run=AsyncMock(return_value=SimpleNamespace(assistant_id="lead_agent")),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.run_once(now=datetime.now(UTC))
+
+    assert [task_id for task_id, _kwargs in getattr(repo, released_attr)] == ["task-1"]
+
+
+class NotificationFallbackCancellationRepo(FakeRepository):
+    def __init__(self):
+        super().__init__()
+        self.release_started = asyncio.Event()
+        self.finish_release = asyncio.Event()
+        self.release_calls = []
+        self.release_interrupted = False
+        self.release_completed = False
+
+    async def claim_cancel_requests(self, **_kwargs):
+        return []
+
+    async def claim_due_tasks(self, **_kwargs):
+        return []
+
+    async def claim_notification_work(self, **_kwargs):
+        if self.claimed:
+            return []
+        self.claimed = True
+        return [
+            {
+                **_claimed_row(),
+                "notification_status": "dispatched",
+                "notification_run_id": "notify-run-1",
+                "dispatch_version": 2,
+            }
+        ]
+
+    async def release_notification_lease(self, task_id, **kwargs):
+        self.release_calls.append((task_id, kwargs))
+        self.release_started.set()
+        try:
+            await self.finish_release.wait()
+        except asyncio.CancelledError:
+            self.release_interrupted = True
+            raise
+        self.release_completed = True
+        return True
+
+
+@pytest.mark.asyncio
+async def test_notification_batch_fallback_release_survives_caller_cancellation():
+    repo = NotificationFallbackCancellationRepo()
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(),
+        get_run=AsyncMock(side_effect=RuntimeError("run store unavailable")),
+    )
+
+    task = asyncio.create_task(service._run_notifications(now=datetime.now(UTC)))
+    await repo.release_started.wait()
+    task.cancel()
+    repo.finish_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert repo.release_interrupted is True
+    assert repo.release_completed is True
+    assert len(repo.release_calls) == 2
+
+
+class NotificationPersistenceRepo:
+    def __init__(self, *, release_error: Exception | None = None):
+        self.claimed = False
+        self.mark_started = asyncio.Event()
+        self.release_calls = []
+        self.release_error = release_error
+
+    async def claim_due_tasks(self, **_kwargs):
+        return []
+
+    async def claim_notification_work(self, **_kwargs):
+        if self.claimed:
+            return []
+        self.claimed = True
+        return [
+            {
+                **_claimed_row(),
+                "notification_status": "claimed",
+                "dispatch_version": 2,
+                "dispatch_attempt": 0,
+                "dispatch_event": {"status": "completed"},
+            }
+        ]
+
+    async def mark_notification_dispatched(self, *_args, **_kwargs):
+        self.mark_started.set()
+        await asyncio.Event().wait()
+
+    async def release_notification_claim(self, task_id, **kwargs):
+        self.release_calls.append((task_id, kwargs))
+        if self.release_error is not None:
+            raise self.release_error
+        return True
+
+
+@pytest.mark.asyncio
+async def test_stop_releases_notification_claim_during_dispatched_persistence():
+    repo = NotificationPersistenceRepo()
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=60,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(return_value={"run_id": "notify-run-1"}),
+        get_run=AsyncMock(return_value=SimpleNamespace(assistant_id="lead_agent")),
+    )
+
+    await service.start()
+    await asyncio.wait_for(repo.mark_started.wait(), timeout=1)
+    await asyncio.wait_for(service.stop(), timeout=1)
+
+    assert repo.release_calls
+    assert {task_id for task_id, _kwargs in repo.release_calls} == {"task-1"}
+
+
+@pytest.mark.asyncio
+async def test_notification_cancellation_preserves_cancelled_error_when_release_fails(caplog):
+    repo = NotificationPersistenceRepo(release_error=RuntimeError("notification release unavailable"))
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(return_value={"run_id": "notify-run-1"}),
+        get_run=AsyncMock(return_value=SimpleNamespace(assistant_id="lead_agent")),
+    )
+    record = (await repo.claim_notification_work())[0]
+
+    task = asyncio.create_task(service._notify_one(record, now=datetime.now(UTC)))
+    await repo.mark_started.wait()
+    task.cancel()
+
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert repo.release_calls
+    assert "notification release unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_notification_cancellation_during_source_run_lookup_releases_claim():
+    lookup_started = asyncio.Event()
+
+    async def get_run(*_args, **_kwargs):
+        lookup_started.set()
+        await asyncio.Event().wait()
+
+    repo = SimpleNamespace(release_notification_claim=AsyncMock(return_value=True))
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(return_value={"run_id": "notify-run-1"}),
+        get_run=get_run,
+    )
+    record = {
+        **_claimed_row(),
+        "notification_status": "claimed",
+        "dispatch_version": 2,
+        "dispatch_attempt": 0,
+        "dispatch_event": {"status": "completed"},
+    }
+
+    task = asyncio.create_task(service._notify_one(record, now=datetime.now(UTC)))
+    await lookup_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    repo.release_notification_claim.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatched_notification_cancellation_preserves_phase_when_releasing_lease():
+    lookup_started = asyncio.Event()
+
+    async def get_run(*_args, **_kwargs):
+        lookup_started.set()
+        await asyncio.Event().wait()
+
+    repo = SimpleNamespace(
+        release_notification_claim=AsyncMock(return_value=True),
+        release_notification_lease=AsyncMock(return_value=True),
+    )
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(),
+        get_run=get_run,
+    )
+    record = {
+        **_claimed_row(),
+        "notification_status": "dispatched",
+        "notification_run_id": "notify-run-1",
+        "dispatch_version": 2,
+    }
+
+    task = asyncio.create_task(service._notify_one(record, now=datetime.now(UTC)))
+    await lookup_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    repo.release_notification_lease.assert_awaited_once()
+    repo.release_notification_claim.assert_not_awaited()
+
+
+class PollPersistenceRepo(FakeRepository):
+    def __init__(self, *, release_error: Exception | None = None):
+        super().__init__([_claimed_row()])
+        self.apply_started = asyncio.Event()
+        self.release_error = release_error
+
+    async def apply_snapshot(self, task_id, **kwargs):
+        self.applied.append((task_id, kwargs))
+        self.apply_started.set()
+        await asyncio.Event().wait()
+
+    async def release_claim(self, task_id, **kwargs):
+        self.released.append((task_id, kwargs))
+        if self.release_error is not None:
+            raise self.release_error
+        return True
+
+
+@pytest.mark.asyncio
+async def test_stop_releases_poll_claim_during_snapshot_persistence():
+    repo = PollPersistenceRepo()
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", FakeDriver(snapshots=[TaskSnapshot(status=TaskStatus.WORKING)]))
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=60,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    await service.start()
+    await asyncio.wait_for(repo.apply_started.wait(), timeout=1)
+    await asyncio.wait_for(service.stop(), timeout=1)
+
+    assert repo.released
+    assert {task_id for task_id, _kwargs in repo.released} == {"task-1"}
+
+
+@pytest.mark.asyncio
+async def test_poll_cancellation_preserves_cancelled_error_when_release_fails(caplog):
+    repo = PollPersistenceRepo(release_error=RuntimeError("poll release unavailable"))
+    driver = HangingDriver()
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", driver)
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    task = asyncio.create_task(service._poll_one(_claimed_row(), now=datetime.now(UTC)))
+    await driver.started.wait()
+    task.cancel()
+
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert repo.released
+    assert "poll release unavailable" in caplog.text

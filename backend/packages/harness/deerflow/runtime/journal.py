@@ -21,6 +21,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
@@ -51,6 +52,12 @@ logger = logging.getLogger(__name__)
 _LEGACY_SUMMARY_MESSAGE_NAME = "summary"
 _RECONCILED_TOOL_MESSAGE_NAMES = frozenset({"ask_clarification"})
 _PERSISTED_HIDDEN_HUMAN_INPUT_RESPONSE_SOURCES = frozenset({"ask_clarification"})
+
+
+@dataclass
+class _DetachedFlush:
+    batch: list[dict]
+    started: bool = False
 
 
 def _should_persist_human_input_message(message: BaseMessage) -> bool:
@@ -668,20 +675,50 @@ class RunJournal(BaseCallbackHandler):
         except RuntimeError:
             # No event loop — keep events in buffer for later async flush.
             return
-        batch = self._buffer.copy()
+        detached = _DetachedFlush(self._buffer.copy())
         self._buffer.clear()
-        task = loop.create_task(self._flush_async(batch))
+        task = loop.create_task(self._flush_async(detached.batch, detached=detached))
         self._pending_flush_tasks.add(task)
-        task.add_done_callback(self._on_flush_done)
+        task.add_done_callback(lambda completed: self._on_flush_done(completed, detached=detached))
 
-    async def _flush_async(self, batch: list[dict]) -> None:
+    async def _put_batch_cancellation_safe(self, batch: list[dict]) -> None:
+        """Drain an in-flight write before deciding whether its batch can be retried."""
+        write_task = asyncio.create_task(self._store.put_batch(batch))
+        write_task.set_name(f"deerflow-journal-put-batch-{self.run_id}")
         try:
-            await self._store.put_batch(batch)
+            await asyncio.shield(write_task)
         except asyncio.CancelledError:
-            # Preserve the batch so it is not lost if the flush is cancelled
-            # mid-write; let the cancellation propagate.
-            self._buffer = batch + self._buffer
+            while not write_task.done():
+                try:
+                    await asyncio.shield(write_task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            try:
+                write_task.result()
+            except asyncio.CancelledError:
+                logger.warning(
+                    "Cancelled journal write task for run %s — returning %d events to buffer",
+                    self.run_id,
+                    len(batch),
+                )
+                self._buffer = batch + self._buffer
+            except Exception:
+                logger.warning(
+                    "Journal write failed while draining cancellation for run %s — returning %d events to buffer",
+                    self.run_id,
+                    len(batch),
+                    exc_info=True,
+                )
+                self._buffer = batch + self._buffer
             raise
+
+    async def _flush_async(self, batch: list[dict], *, detached: _DetachedFlush | None = None) -> None:
+        if detached is not None:
+            detached.started = True
+        try:
+            await self._put_batch_cancellation_safe(batch)
         except Exception:
             logger.warning(
                 "Failed to flush %d events for run %s — returning to buffer",
@@ -692,9 +729,11 @@ class RunJournal(BaseCallbackHandler):
             # Return failed events to buffer for retry on next flush
             self._buffer = batch + self._buffer
 
-    def _on_flush_done(self, task: asyncio.Task) -> None:
+    def _on_flush_done(self, task: asyncio.Task, *, detached: _DetachedFlush) -> None:
         self._pending_flush_tasks.discard(task)
         if task.cancelled():
+            if not detached.started:
+                self._buffer = detached.batch + self._buffer
             return
         exc = task.exception()
         if exc:
@@ -906,10 +945,7 @@ class RunJournal(BaseCallbackHandler):
             batch = self._buffer[: self._flush_threshold]
             del self._buffer[: self._flush_threshold]
             try:
-                await self._store.put_batch(batch)
-            except asyncio.CancelledError:
-                self._buffer = batch + self._buffer
-                raise
+                await self._put_batch_cancellation_safe(batch)
             except Exception:
                 self._buffer = batch + self._buffer
                 raise

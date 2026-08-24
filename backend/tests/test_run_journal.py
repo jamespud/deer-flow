@@ -422,6 +422,95 @@ class TestBufferFlush:
         events = await store.list_events("t1", "r1")
         assert any(e["event_type"] == "llm.ai.response" for e in events)
 
+    @pytest.mark.anyio
+    async def test_threshold_flush_cancelled_before_start_requeues_detached_batch(self):
+        store = MemoryRunEventStore()
+        journal = RunJournal("r1", "t1", store, flush_threshold=1)
+        journal.record_delivery()
+
+        flush_task = next(iter(journal._pending_flush_tasks))
+        flush_task.cancel()
+        await asyncio.gather(flush_task, return_exceptions=True)
+        await asyncio.sleep(0)
+
+        await journal.flush()
+        events = await store.list_events("t1", "r1")
+        assert [event["event_type"] for event in events] == ["run.delivery"]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("background_flush", [False, True], ids=["explicit", "threshold"])
+    async def test_cancelled_jsonl_flush_does_not_requeue_committed_batch(self, tmp_path, monkeypatch, background_flush):
+        from deerflow.runtime.events.store.jsonl import JsonlRunEventStore
+
+        async def inline_to_thread(func, /, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "to_thread", inline_to_thread)
+        store = JsonlRunEventStore(base_dir=tmp_path / "jsonl")
+        journal = RunJournal("r1", "t1", store, flush_threshold=1 if background_flush else 100)
+        write_completed = asyncio.Event()
+        allow_write_return = asyncio.Event()
+        original_write_batch = store._write_batch_async
+
+        async def write_then_block_return(thread_id, batch):
+            records = await original_write_batch(thread_id, batch)
+            write_completed.set()
+            await allow_write_return.wait()
+            return records
+
+        monkeypatch.setattr(store, "_write_batch_async", write_then_block_return)
+        journal.record_delivery()
+
+        flush_task = next(iter(journal._pending_flush_tasks)) if background_flush else asyncio.create_task(journal.flush())
+        await asyncio.wait_for(write_completed.wait(), timeout=1)
+        flush_task.cancel()
+        await asyncio.sleep(0)
+        flush_task.cancel()
+        allow_write_return.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(flush_task, timeout=1)
+
+        await asyncio.wait_for(journal.flush(), timeout=1)
+        events = await store.list_events("t1", "r1")
+        assert [event["event_type"] for event in events] == ["run.delivery"]
+
+    @pytest.mark.anyio
+    async def test_cancelled_flush_drains_failed_write_before_requeueing_batch(self):
+        class FailingStore:
+            def __init__(self):
+                self.write_started = asyncio.Event()
+                self.allow_failure = asyncio.Event()
+                self.write_cancelled = False
+                self.write_finished = False
+
+            async def put_batch(self, _batch):
+                self.write_started.set()
+                try:
+                    await self.allow_failure.wait()
+                except asyncio.CancelledError:
+                    self.write_cancelled = True
+                    raise
+                self.write_finished = True
+                raise RuntimeError("write failed")
+
+        store = FailingStore()
+        journal = RunJournal("r1", "t1", store, flush_threshold=100)
+        journal.record_delivery()
+        flush_task = asyncio.create_task(journal.flush())
+        await store.write_started.wait()
+        flush_task.cancel()
+        await asyncio.sleep(0)
+        flush_task.cancel()
+        store.allow_failure.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(flush_task, timeout=1)
+
+        assert store.write_finished is True
+        assert store.write_cancelled is False
+        assert [event["event_type"] for event in journal._buffer] == ["run.delivery"]
+
 
 class TestIdentifyCaller:
     def test_lead_agent_tag(self, journal_setup):

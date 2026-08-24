@@ -142,3 +142,18 @@ PYTHONPATH=. uv run python scripts/benchmark/checkpoint/bench_production.py \
 PYTHONPATH=. uv run python scripts/benchmark/checkpoint/summarize_production.py \
   /tmp/production-bench.jsonl
 ```
+
+### Cancellation-Safe Run Journal Writes
+
+`RunJournal` transfers each detached batch to a dedicated `put_batch` task and
+shields that task from caller cancellation. If the caller is cancelled, the
+journal drains the write through repeated cancellation before deciding whether
+the batch still belongs in memory: a successful write is never requeued, while
+a confirmed write failure restores the batch ahead of newer buffered events. If
+the scheduled flush is cancelled before its first coroutine step, its completion
+callback restores the still-unowned detached batch instead.
+This boundary applies to both threshold-triggered background flushes and the
+worker's final explicit `flush()`. Do not reintroduce a direct
+`except CancelledError: requeue` around event-store writes; JSONL `to_thread`
+appends and database commits can finish after their caller observes cancellation,
+which would duplicate an already-persisted batch on retry.

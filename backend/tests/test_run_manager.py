@@ -129,12 +129,117 @@ class PausedLostLeaseRunStore(MemoryRunStore):
         return False
 
 
+class BlockingFinalizationRunStore(MemoryRunStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.finalization_started = asyncio.Event()
+
+    async def finalize_if_not_cancelled(self, *args, **kwargs):
+        self.finalization_started.set()
+        await asyncio.Event().wait()
+
+
+class FailingFinalizationRunStore(MemoryRunStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.finalization_failed = asyncio.Event()
+
+    async def finalize_if_not_cancelled(self, *args, **kwargs):
+        self.finalization_failed.set()
+        raise RuntimeError("finalization unavailable")
+
+
 async def _stored_statuses(store: MemoryRunStore, *run_ids: str) -> dict[str, Any]:
     rows = {}
     for run_id in run_ids:
         row = await store.get(run_id)
         rows[run_id] = row["status"] if row else None
     return rows
+
+
+@pytest.mark.anyio
+async def test_repeated_cancellation_during_finalization_still_fences_local_run():
+    store = BlockingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+    task = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_started.wait()
+    await manager._lock.acquire()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    manager._lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert record.ownership_lost is True
+    assert record.abort_event.is_set() is True
+    assert record.status == RunStatus.error
+
+
+@pytest.mark.anyio
+async def test_finalization_fence_failure_preserves_caller_cancellation(monkeypatch, caplog):
+    store = BlockingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+
+    async def fail_fence(*_args, **_kwargs):
+        raise RuntimeError("fence unavailable")
+
+    monkeypatch.setattr(manager, "_mark_ownership_lost", fail_fence)
+    task = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_started.wait()
+    task.cancel()
+
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert "fence unavailable" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_cancellation_during_normal_error_finalization_fence_still_fences_local_run():
+    store = FailingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+        persistence_retry_policy=PersistenceRetryPolicy(max_attempts=1, initial_delay=0),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+    await manager._lock.acquire()
+    task = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_failed.wait()
+    await asyncio.sleep(0)
+    task.cancel()
+    manager._lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert record.ownership_lost is True
+    assert record.abort_event.is_set() is True
 
 
 @pytest.mark.anyio
