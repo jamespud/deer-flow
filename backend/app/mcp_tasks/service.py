@@ -42,6 +42,36 @@ def _bound_error(error: str | None) -> str | None:
     return error[:_MAX_PERSISTED_ERROR_CHARS]
 
 
+async def _drain_cancellation_operation(
+    operation: Awaitable[Any],
+    *,
+    action: str,
+    task_id: str,
+) -> tuple[bool, Any]:
+    """Drain one operation through repeated cancellation and capture its result."""
+    task = asyncio.ensure_future(operation)
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+    try:
+        return True, task.result()
+    except asyncio.CancelledError:
+        logger.error("MCP task cancellation operation was cancelled (%s, task_id=%s)", action, task_id)
+    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort; preserve original cancellation
+        logger.error(
+            "MCP task cancellation operation failed (%s, task_id=%s): %s",
+            action,
+            task_id,
+            exc,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+    return False, None
+
+
 async def _drain_cancellation_compensation(
     compensation: Awaitable[Any],
     *,
@@ -49,26 +79,11 @@ async def _drain_cancellation_compensation(
     task_id: str,
 ) -> None:
     """Finish best-effort cleanup without replacing the caller's cancellation."""
-    cleanup = asyncio.ensure_future(compensation)
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            continue
-        except Exception:
-            break
-    try:
-        cleanup.result()
-    except asyncio.CancelledError:
-        logger.error("MCP task cancellation compensation was cancelled (%s, task_id=%s)", action, task_id)
-    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort; preserve original cancellation
-        logger.error(
-            "MCP task cancellation compensation failed (%s, task_id=%s): %s",
-            action,
-            task_id,
-            exc,
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
+    await _drain_cancellation_operation(
+        compensation,
+        action=action,
+        task_id=task_id,
+    )
 
 
 class McpTaskService:
@@ -246,11 +261,15 @@ class McpTaskService:
     async def run_once(self, *, now: datetime) -> None:
         await self._run_cancellations(now=now)
 
-        claimed = await self._repository.claim_due_tasks(
-            now=now,
-            lease_owner=self._lease_owner,
-            lease_seconds=self._lease_seconds,
-            limit=self._max_concurrent_polls,
+        claimed = await self._claim_with_cancellation_release(
+            self._repository.claim_due_tasks(
+                now=now,
+                lease_owner=self._lease_owner,
+                lease_seconds=self._lease_seconds,
+                limit=self._max_concurrent_polls,
+            ),
+            action="poll claim",
+            release=self._release_poll_after_cancellation,
         )
         if claimed:
             try:
@@ -333,11 +352,15 @@ class McpTaskService:
         claim = getattr(self._repository, "claim_cancel_requests", None)
         if claim is None:
             return
-        records = await claim(
-            now=now,
-            lease_owner=self._lease_owner,
-            lease_seconds=self._lease_seconds,
-            limit=self._max_concurrent_polls,
+        records = await self._claim_with_cancellation_release(
+            claim(
+                now=now,
+                lease_owner=self._lease_owner,
+                lease_seconds=self._lease_seconds,
+                limit=self._max_concurrent_polls,
+            ),
+            action="cancel claim",
+            release=self._release_cancel_after_cancellation,
         )
         if records:
             try:
@@ -399,12 +422,16 @@ class McpTaskService:
     async def _run_notifications(self, *, now: datetime) -> None:
         if self._launch_notification is None or self._get_run is None:
             return
-        records = await self._repository.claim_notification_work(
-            now=now,
-            lease_owner=self._lease_owner,
-            lease_seconds=self._lease_seconds,
-            limit=self._max_concurrent_polls,
-            tracking_degraded_after_errors=self._tracking_degraded_after_errors,
+        records = await self._claim_with_cancellation_release(
+            self._repository.claim_notification_work(
+                now=now,
+                lease_owner=self._lease_owner,
+                lease_seconds=self._lease_seconds,
+                limit=self._max_concurrent_polls,
+                tracking_degraded_after_errors=self._tracking_degraded_after_errors,
+            ),
+            action="notification claim",
+            release=self._release_notification_after_cancellation,
         )
         if records:
             try:
@@ -567,6 +594,51 @@ class McpTaskService:
         except asyncio.CancelledError:
             await self._release_poll_after_cancellation(record)
             raise
+
+    async def _claim_with_cancellation_release(
+        self,
+        claim: Awaitable[list[dict[str, Any]]],
+        *,
+        action: str,
+        release: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> list[dict[str, Any]]:
+        claim_task = asyncio.ensure_future(claim)
+        try:
+            return await asyncio.shield(claim_task)
+        except asyncio.CancelledError:
+            completed, records = await _drain_cancellation_operation(
+                claim_task,
+                action=f"drain {action}",
+                task_id="batch",
+            )
+            if completed and records:
+                release_task = asyncio.create_task(
+                    self._release_claimed_records(records, release=release),
+                    name=f"mcp-release-{action.replace(' ', '-')}-batch",
+                )
+                await _drain_cancellation_operation(
+                    release_task,
+                    action=f"release {action} batch",
+                    task_id="batch",
+                )
+            raise
+
+    async def _release_claimed_records(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        release: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        for record in records:
+            try:
+                await release(record)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - release every record in the claimed batch
+                logger.exception(
+                    "Unexpected MCP task claim release failure (task_id=%s)",
+                    record.get("id"),
+                )
 
     async def _release_cancel_after_cancellation(self, record: dict[str, Any]) -> None:
         await _drain_cancellation_compensation(

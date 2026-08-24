@@ -1561,12 +1561,13 @@ class CancelAfterClaimRepository(FakeRepository):
     def __init__(self, *, phase: str):
         super().__init__()
         self.phase = phase
+        self.caller_task = None
         self.cancel_releases = []
         self.notification_claim_releases = []
         self.notification_lease_releases = []
 
     def _cancel_caller(self):
-        task = asyncio.current_task()
+        task = self.caller_task
         assert task is not None
         task.cancel()
 
@@ -1623,6 +1624,7 @@ class CancelAfterClaimRepository(FakeRepository):
 )
 async def test_cancellation_immediately_after_claim_releases_every_record(phase, released_attr):
     repo = CancelAfterClaimRepository(phase=phase)
+    repo.caller_task = asyncio.current_task()
     drivers = McpTaskDriverRegistry()
     drivers.register("fake", FakeDriver())
     service = McpTaskService(
@@ -1638,6 +1640,87 @@ async def test_cancellation_immediately_after_claim_releases_every_record(phase,
     with pytest.raises(asyncio.CancelledError):
         await service.run_once(now=datetime.now(UTC))
 
+    assert [task_id for task_id, _kwargs in getattr(repo, released_attr)] == ["task-1"]
+
+
+class DurableClaimHandoffRepository(CancelAfterClaimRepository):
+    def __init__(self, *, phase: str):
+        super().__init__(phase=phase)
+        self.claim_committed = asyncio.Event()
+        self.allow_claim_return = asyncio.Event()
+        self.claim_cancelled = False
+
+    async def _return_after_commit(self, records):
+        self.claim_committed.set()
+        try:
+            await self.allow_claim_return.wait()
+        except asyncio.CancelledError:
+            self.claim_cancelled = True
+            raise
+        return records
+
+    async def claim_cancel_requests(self, **_kwargs):
+        if self.phase != "cancel":
+            return []
+        return await self._return_after_commit([_claimed_row()])
+
+    async def claim_due_tasks(self, **_kwargs):
+        if self.phase != "poll":
+            return []
+        return await self._return_after_commit([_claimed_row()])
+
+    async def claim_notification_work(self, **_kwargs):
+        if not self.phase.startswith("notification_"):
+            return []
+        status = self.phase.removeprefix("notification_")
+        return await self._return_after_commit(
+            [
+                {
+                    **_claimed_row(),
+                    "notification_status": status,
+                    "notification_run_id": "notify-run-1" if status == "dispatched" else None,
+                    "dispatch_version": 2,
+                    "dispatch_attempt": 0,
+                    "dispatch_event": {"status": "completed"},
+                }
+            ]
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "released_attr"),
+    [
+        ("poll", "released"),
+        ("cancel", "cancel_releases"),
+        ("notification_claimed", "notification_claim_releases"),
+        ("notification_dispatched", "notification_lease_releases"),
+    ],
+)
+async def test_cancellation_during_durable_claim_handoff_drains_and_releases(phase, released_attr):
+    repo = DurableClaimHandoffRepository(phase=phase)
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(),
+        get_run=AsyncMock(),
+    )
+
+    task = asyncio.create_task(service.run_once(now=datetime.now(UTC)))
+    await repo.claim_committed.wait()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
+    repo.allow_claim_return.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert repo.claim_cancelled is False
     assert [task_id for task_id, _kwargs in getattr(repo, released_attr)] == ["task-1"]
 
 
