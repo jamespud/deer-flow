@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from sqlalchemy.exc import DatabaseError as SQLAlchemyDatabaseError
 
+import deerflow.runtime.runs.manager as manager_module
 from deerflow.config.run_ownership_config import RunOwnershipConfig
 from deerflow.runtime import DisconnectMode, RunManager, RunStatus, ThreadOperationKind
 from deerflow.runtime.events.store.memory import MemoryRunEventStore
@@ -240,6 +241,273 @@ async def test_cancellation_during_normal_error_finalization_fence_still_fences_
 
     assert record.ownership_lost is True
     assert record.abort_event.is_set() is True
+
+
+@pytest.mark.anyio
+async def test_hung_finalization_fence_transfers_to_background(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(manager_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    store = BlockingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+    fence_started = asyncio.Event()
+    finish_fence = asyncio.Event()
+    fence_calls = 0
+    original_mark = manager._mark_ownership_lost
+
+    async def hung_mark(*args, **kwargs):
+        nonlocal fence_calls
+        fence_calls += 1
+        fence_started.set()
+        await finish_fence.wait()
+        await original_mark(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_mark_ownership_lost", hung_mark)
+    caller = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_started.wait()
+    caller.cancel()
+    await fence_started.wait()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, timeout=0.2)
+    assert len(manager._cancellation_cleanup_tasks) == 1
+
+    finish_fence.set()
+    await asyncio.gather(*tuple(manager._cancellation_cleanup_tasks), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert record.ownership_lost is True
+    assert fence_calls == 1
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_hung_cancelled_admission_cleanup_transfers_to_background(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(manager_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    store = MemoryRunStore()
+    manager = RunManager(store=store)
+    old = await manager.create("thread-1")
+    await manager.set_status(old.run_id, RunStatus.running)
+    old_persist_started = asyncio.Event()
+    release_old_persist = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    cleanup_calls = 0
+    original_persist = manager._persist_status
+    original_close = manager._close_cancelled_admission
+
+    async def block_old_persist(record, status, **kwargs):
+        if record.run_id == old.run_id:
+            old_persist_started.set()
+            await release_old_persist.wait()
+        return await original_persist(record, status, **kwargs)
+
+    async def hung_close(record):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        await finish_cleanup.wait()
+        await original_close(record)
+
+    monkeypatch.setattr(manager, "_persist_status", block_old_persist)
+    monkeypatch.setattr(manager, "_close_cancelled_admission", hung_close)
+    caller = asyncio.create_task(manager.create_or_reject("thread-1", multitask_strategy="interrupt"))
+    await old_persist_started.wait()
+    replacement = next(record for record in manager._runs.values() if record.run_id != old.run_id)
+    caller.cancel()
+    release_old_persist.set()
+    await cleanup_started.wait()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, timeout=0.2)
+    assert len(manager._cancellation_cleanup_tasks) == 1
+
+    finish_cleanup.set()
+    await asyncio.gather(*tuple(manager._cancellation_cleanup_tasks), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert replacement.status == RunStatus.interrupted
+    assert cleanup_calls == 1
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cleanup_error", [RuntimeError("fence unavailable"), asyncio.CancelledError()], ids=["failure", "self-cancel"])
+async def test_late_cancellation_cleanup_outcome_is_consumed_without_replacing_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cleanup_error: BaseException,
+):
+    monkeypatch.setattr(manager_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    store = BlockingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+    finish_cleanup = asyncio.Event()
+
+    async def late_cleanup(*_args, **_kwargs):
+        await finish_cleanup.wait()
+        raise cleanup_error
+
+    monkeypatch.setattr(manager, "_mark_ownership_lost", late_cleanup)
+    caller = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_started.wait()
+    caller.cancel()
+
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, timeout=0.2)
+    assert len(manager._cancellation_cleanup_tasks) == 1
+
+    finish_cleanup.set()
+    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    await asyncio.gather(cleanup, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert not manager._cancellation_cleanup_tasks
+    assert caplog.text.count(f"run_id={record.run_id}") == 1
+    assert "Run cancellation cleanup" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_repeated_cancellation_uses_one_cleanup_task_and_absolute_deadline(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(manager_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.03)
+    store = BlockingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+    finish_cleanup = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_calls = 0
+    observed = []
+    original_wait = manager_module.wait_for_task_until
+
+    async def record_wait(task, *, deadline):
+        observed.append((task, deadline))
+        return await original_wait(task, deadline=deadline)
+
+    async def late_cleanup(*_args, **_kwargs):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        await finish_cleanup.wait()
+
+    monkeypatch.setattr(manager_module, "wait_for_task_until", record_wait)
+    monkeypatch.setattr(manager, "_mark_ownership_lost", late_cleanup)
+    caller = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_started.wait()
+    caller.cancel()
+    await cleanup_started.wait()
+    await asyncio.sleep(0.005)
+    caller.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, timeout=0.2)
+    assert len(observed) == 1
+    assert len(manager._cancellation_cleanup_tasks) == 1
+    cleanup = observed[0][0]
+    finish_cleanup.set()
+    await asyncio.gather(cleanup, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert cleanup_calls == 1
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_observes_supervised_cleanup_only_within_budget(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    finish_cleanup = asyncio.Event()
+
+    async def wait_for_cleanup() -> None:
+        await finish_cleanup.wait()
+
+    cleanup = asyncio.create_task(wait_for_cleanup())
+    manager._track_cancellation_cleanup(cleanup, action="test cleanup", run_id="run-1")
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    with caplog.at_level(logging.WARNING):
+        await manager.shutdown(timeout=0.01)
+
+    assert loop.time() - started < 0.2
+    assert cleanup.done() is False
+    assert cleanup in manager._cancellation_cleanup_tasks
+    assert "cancellation cleanup task" in caplog.text
+    finish_cleanup.set()
+    await cleanup
+    await asyncio.sleep(0)
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_observes_cleanup_registered_by_cancelled_run_before_deadline():
+    manager = RunManager()
+    cleanup_finished = asyncio.Event()
+    cleanup_registered = asyncio.Event()
+
+    async def run() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(cleanup_finished.wait())
+            manager._track_cancellation_cleanup(cleanup, action="dynamic cleanup", run_id="run-1")
+            cleanup_registered.set()
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.2))
+    await cleanup_registered.wait()
+    assert shutdown_task.done() is False
+    cleanup_finished.set()
+    await shutdown_task
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_keeps_dynamic_cleanup_supervised_after_deadline(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    cleanup_registered = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    async def run() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(cleanup_finished.wait())
+            manager._track_cancellation_cleanup(cleanup, action="stalled dynamic cleanup", run_id="run-1")
+            cleanup_registered.set()
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    with caplog.at_level(logging.WARNING):
+        shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.05))
+        await cleanup_registered.wait()
+        await shutdown_task
+
+    assert any("cancellation cleanup task" in message for message in caplog.messages)
+    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    assert cleanup.done() is False
+    cleanup_finished.set()
+    await cleanup
+    await asyncio.sleep(0)
+    assert not manager._cancellation_cleanup_tasks
 
 
 @pytest.mark.anyio
