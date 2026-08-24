@@ -145,21 +145,28 @@ PYTHONPATH=. uv run python scripts/benchmark/checkpoint/summarize_production.py 
 
 ### Bounded Cancellation Drains
 
-Source map (paths relative to `backend/`): `runtime/cancellation.py` owns shared
-drain predicates and waits; `app/mcp_tasks/service.py` owns MCP claim, batch,
-release, and stop handoffs; `runtime/journal.py` owns event-store writes; and
-`runtime/runs/manager.py` owns run cancellation, finalization, and shutdown.
+Source map (paths relative to `backend/`):
+`packages/harness/deerflow/runtime/cancellation.py` provides the shared absolute-
+deadline wait primitive; `app/mcp_tasks/service.py` owns MCP claim, batch,
+release, and stop handoffs; `packages/harness/deerflow/runtime/journal.py` owns
+event-store writes; and `packages/harness/deerflow/runtime/runs/manager.py` owns
+run cancellation, finalization, and shutdown. Inner-vs-outer cancellation
+predicates remain in the MCP service.
 
-Each boundary currently uses a fixed internal five-second monotonic deadline
-(`loop.time()`); the constants remain module-local. Repeated caller
-cancellation is absorbed while the same absolute deadline remains in force;
-cancellation never renews the wait. When caller-cancellation draining times out:
+Cancellation drains and `McpTaskService.stop()` currently use the module-local
+`_CANCELLATION_DRAIN_TIMEOUT_SECONDS = 5.0` monotonic deadline (`loop.time()`);
+this constant does not define `RunManager.shutdown`. Repeated caller cancellation
+is absorbed while the same absolute deadline remains in force; cancellation never
+renews the wait. When caller-cancellation draining times out:
 the exact asyncio operation task remains retained by the subsystem-owned registry after timeout.
 The original `CancelledError` is re-raised, while
 normal `McpTaskService.stop()` and `RunManager.shutdown()` record/log the
-deadline and return as retained work continues. The retained owner consumes the
-eventual success, failure, or cancellation exactly once; it must not blindly
-retry or requeue an operation whose durable outcome is unknown.
+deadline and return as retained work continues. `RunManager.shutdown(timeout=5.0)`
+keeps a caller-provided hard total budget (the default is overrideable), computes
+one absolute deadline, and gives nested waits only the remaining time. The
+retained owner consumes the eventual success, failure, or cancellation exactly
+once; it must not blindly retry or requeue an operation whose durable outcome is
+unknown.
 
 RunManager applies its caller-provided shutdown hard total budget across
 cancellation-cleanup producers, manager-lock waiters, in-flight run
