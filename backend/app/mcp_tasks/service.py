@@ -1119,7 +1119,10 @@ class McpTaskService:
 
     async def _release_poll_after_cancellation(self, record: dict[str, Any]) -> None:
         await self._drain_cancellation_compensation(
-            self._release_after_error(record, now=datetime.now(UTC), error="cancelled"),
+            self._repository.release_poll_claim_after_cancellation(
+                record["id"],
+                lease_owner=self._lease_owner,
+            ),
             action="release poll claim",
             task_id=record["id"],
         )

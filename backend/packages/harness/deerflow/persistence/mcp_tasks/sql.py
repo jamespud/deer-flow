@@ -304,6 +304,27 @@ class McpTaskRepository:
             await session.commit()
             return True
 
+    async def release_poll_claim_after_cancellation(
+        self,
+        task_id: str,
+        *,
+        lease_owner: str,
+    ) -> bool:
+        """Release a cancelled poll's lease without recording a poll failure."""
+        stmt = (
+            update(McpTaskRow)
+            .where(McpTaskRow.id == task_id, McpTaskRow.lease_owner == lease_owner)
+            .values(
+                lease_owner=None,
+                lease_expires_at=None,
+                updated_at=datetime.now(UTC),
+            )
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return bool(result.rowcount)
+
     async def request_cancel(
         self,
         task_id: str,

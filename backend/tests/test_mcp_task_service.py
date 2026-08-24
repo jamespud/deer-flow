@@ -48,6 +48,10 @@ class FakeRepository:
         self.released.append((task_id, kwargs))
         return True
 
+    async def release_poll_claim_after_cancellation(self, task_id, **kwargs):
+        self.released.append((task_id, kwargs))
+        return True
+
 
 class FailingApplyRepository(FakeRepository):
     async def apply_snapshot(self, task_id, **kwargs):
@@ -2391,6 +2395,7 @@ class PollPersistenceRepo(FakeRepository):
         super().__init__([_claimed_row()])
         self.apply_started = asyncio.Event()
         self.release_error = release_error
+        self.cancelled_releases = []
 
     async def apply_snapshot(self, task_id, **kwargs):
         self.applied.append((task_id, kwargs))
@@ -2399,6 +2404,12 @@ class PollPersistenceRepo(FakeRepository):
 
     async def release_claim(self, task_id, **kwargs):
         self.released.append((task_id, kwargs))
+        if self.release_error is not None:
+            raise self.release_error
+        return True
+
+    async def release_poll_claim_after_cancellation(self, task_id, **kwargs):
+        self.cancelled_releases.append((task_id, kwargs))
         if self.release_error is not None:
             raise self.release_error
         return True
@@ -2421,8 +2432,34 @@ async def test_stop_releases_poll_claim_during_snapshot_persistence():
     await asyncio.wait_for(repo.apply_started.wait(), timeout=1)
     await asyncio.wait_for(service.stop(), timeout=1)
 
-    assert repo.released
-    assert {task_id for task_id, _kwargs in repo.released} == {"task-1"}
+    assert repo.cancelled_releases
+    assert {task_id for task_id, _kwargs in repo.cancelled_releases} == {"task-1"}
+    assert repo.released == []
+
+
+@pytest.mark.asyncio
+async def test_poll_cancellation_releases_only_the_current_poll_lease():
+    repo = PollPersistenceRepo()
+    driver = HangingDriver()
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", driver)
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    task = asyncio.create_task(service._poll_one(_claimed_row(), now=datetime.now(UTC)))
+    await driver.started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert repo.cancelled_releases == [("task-1", {"lease_owner": service._lease_owner})]
+    assert repo.released == []
 
 
 @pytest.mark.asyncio
@@ -2446,7 +2483,8 @@ async def test_poll_cancellation_preserves_cancelled_error_when_release_fails(ca
     with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
         await task
 
-    assert repo.released
+    assert repo.cancelled_releases
+    assert repo.released == []
     assert "poll release unavailable" in caplog.text
 
 
@@ -2613,7 +2651,7 @@ async def test_hung_cancellation_compensation_transfers_to_background(monkeypatc
     release_gate = asyncio.Event()
     release_calls = []
 
-    async def release_claim(task_id, **_kwargs):
+    async def release_poll_claim_after_cancellation(task_id, **_kwargs):
         release_calls.append(task_id)
         release_started.set()
         await release_gate.wait()
@@ -2623,7 +2661,7 @@ async def test_hung_cancellation_compensation_transfers_to_background(monkeypatc
     drivers = McpTaskDriverRegistry()
     drivers.register("fake", driver)
     service = McpTaskService(
-        repository=SimpleNamespace(release_claim=release_claim),
+        repository=SimpleNamespace(release_poll_claim_after_cancellation=release_poll_claim_after_cancellation),
         drivers=drivers,
         poll_interval_seconds=5,
         lease_seconds=120,
@@ -2654,7 +2692,7 @@ async def test_background_compensation_failure_is_consumed(monkeypatch, caplog):
     release_gate = asyncio.Event()
     release_calls = []
 
-    async def release_claim(task_id, **_kwargs):
+    async def release_poll_claim_after_cancellation(task_id, **_kwargs):
         release_calls.append(task_id)
         release_started.set()
         await release_gate.wait()
@@ -2664,7 +2702,7 @@ async def test_background_compensation_failure_is_consumed(monkeypatch, caplog):
     drivers = McpTaskDriverRegistry()
     drivers.register("fake", driver)
     service = McpTaskService(
-        repository=SimpleNamespace(release_claim=release_claim),
+        repository=SimpleNamespace(release_poll_claim_after_cancellation=release_poll_claim_after_cancellation),
         drivers=drivers,
         poll_interval_seconds=5,
         lease_seconds=120,

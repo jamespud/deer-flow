@@ -289,6 +289,58 @@ async def test_release_claim_retries_transient_poll_failure(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_release_poll_claim_after_cancellation_preserves_poll_failure_state(tmp_path):
+    repo = await _make_repo(tmp_path)
+    now = datetime.now(UTC)
+    await _create_working_task(repo, task_id="task-cancelled-poll", now=now)
+    await repo.claim_due_tasks(now=now, lease_owner="worker-1", lease_seconds=60, limit=10)
+    retry_at = now + timedelta(seconds=30)
+    await repo.release_claim(
+        "task-cancelled-poll",
+        lease_owner="worker-1",
+        next_poll_at=retry_at,
+        error="temporary network failure",
+    )
+    before = await repo.get("task-cancelled-poll", user_id="user-1")
+    assert before is not None
+
+    await repo.claim_due_tasks(now=retry_at, lease_owner="worker-2", lease_seconds=60, limit=10)
+    released = await repo.release_poll_claim_after_cancellation(
+        "task-cancelled-poll",
+        lease_owner="worker-2",
+    )
+
+    assert released is True
+    stored = await repo.get("task-cancelled-poll", user_id="user-1")
+    assert stored is not None
+    assert stored["next_poll_at"] == before["next_poll_at"]
+    assert stored["last_poll_error"] == before["last_poll_error"]
+    assert stored["consecutive_poll_error_count"] == before["consecutive_poll_error_count"]
+    assert stored["poll_attempt_count"] == before["poll_attempt_count"] + 1
+    assert stored["lease_owner"] is None
+    assert stored["lease_expires_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_release_poll_claim_after_cancellation_requires_current_owner(tmp_path):
+    repo = await _make_repo(tmp_path)
+    now = datetime.now(UTC)
+    await _create_working_task(repo, task_id="task-stale-cancel", now=now)
+    await repo.claim_due_tasks(now=now, lease_owner="worker-current", lease_seconds=60, limit=10)
+
+    released = await repo.release_poll_claim_after_cancellation(
+        "task-stale-cancel",
+        lease_owner="worker-stale",
+    )
+
+    assert released is False
+    stored = await repo.get("task-stale-cancel", user_id="user-1")
+    assert stored is not None
+    assert stored["lease_owner"] == "worker-current"
+    assert stored["lease_expires_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_consecutive_poll_error_count_increments_and_resets_on_success(tmp_path):
     repo = await _make_repo(tmp_path)
     now = datetime.now(UTC)
