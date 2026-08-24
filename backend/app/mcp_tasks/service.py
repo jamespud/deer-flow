@@ -511,9 +511,20 @@ class McpTaskService:
                 supervisor_result,
                 exc_info=(type(supervisor_result), supervisor_result, supervisor_result.__traceback__),
             )
-        for child in children:
+        for state, child in zip(states, children, strict=True):
             if child.done():
-                _consume_task_error(child)
+                error = _consume_task_error(child)
+                if error is None or isinstance(error, asyncio.CancelledError):
+                    continue
+                failure_action = "cancellation" if action == "cancel" else action
+                lease_suffix = "; the lease will expire for recovery" if action in {"poll", "cancel"} else ""
+                logger.error(
+                    "Unexpected MCP task %s failure (task_id=%s)%s",
+                    failure_action,
+                    state.record.get("id"),
+                    lease_suffix,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
 
     async def _run_claimed_batch(
         self,

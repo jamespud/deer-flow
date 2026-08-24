@@ -2794,6 +2794,59 @@ async def test_batch_child_self_cancellation_releases_once(phase):
         assert [task_id for task_id, _kwargs in repo.cancel_releases] == ["task-1"]
 
 
+@pytest.mark.asyncio
+async def test_batch_outer_cancellation_logs_unexpected_child_failure_once(caplog):
+    service = McpTaskService(
+        repository=SimpleNamespace(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    rows = [
+        _claimed_row(),
+        {**_claimed_row(), "id": "task-2", "remote_task_id": "remote-2"},
+    ]
+    child_started = {row["id"]: asyncio.Event() for row in rows}
+    release_finished = {row["id"]: asyncio.Event() for row in rows}
+    release_calls = []
+
+    async def operation(record):
+        child_started[record["id"]].set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            raise RuntimeError(f"child failed during cancellation handoff ({record['id']})")
+
+    async def release(record):
+        release_calls.append(record["id"])
+        release_finished[record["id"]].set()
+
+    caller = asyncio.create_task(
+        service._run_claimed_batch(
+            rows,
+            operation=operation,
+            release=release,
+            action="poll",
+        )
+    )
+    await asyncio.gather(*(event.wait() for event in child_started.values()))
+    caller.cancel("outer cancellation")
+
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
+        await caller
+
+    failures = [record for record in caplog.records if "Unexpected MCP task poll failure" in record.getMessage()]
+    assert len(failures) == len(rows)
+    for row in rows:
+        task_id = row["id"]
+        assert release_finished[task_id].is_set()
+        assert release_calls.count(task_id) == 1
+        matching_failures = [failure for failure in failures if f"task_id={task_id}" in failure.getMessage()]
+        assert len(matching_failures) == 1
+        assert f"child failed during cancellation handoff ({task_id})" in caplog.text
+
+
 class SelfCancellingNotificationRepository(FakeRepository):
     def __init__(self):
         super().__init__()
