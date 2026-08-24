@@ -176,9 +176,11 @@ predicate: a self-cancelled claim is consumed only when no caller cancellation
 is pending, otherwise the caller's cancellation wins. Notification cancellation
 does not enter ordinary retry handling. The supervisor task, every child task,
 and every ordinary or cancellation release task are retrieved and their
-terminal success, failure, or cancellation is consumed exactly once. Failures
-receive one contextual log; successful completion clears task ownership without
-emitting a second log.
+terminal success, failure, or cancellation is consumed exactly once. Release,
+supervisor, and background-ownership failures receive one contextual log; child
+failures may be aggregated and logged as unexpected failures at the batch
+boundary rather than individually. Successful completion clears task ownership
+without emitting a second log.
 
 `McpTaskService.stop()` establishes one absolute `loop.time()` deadline for the
 poller cleanup. Repeated or concurrent `stop()` calls reuse that deadline and
