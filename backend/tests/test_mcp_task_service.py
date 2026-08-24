@@ -2107,6 +2107,42 @@ async def test_batch_release_starts_sibling_when_first_release_hangs():
 
 
 @pytest.mark.asyncio
+async def test_batch_release_logs_cancelled_record_and_finishes_sibling(caplog):
+    sibling_completed = asyncio.Event()
+    release_calls = []
+
+    async def release(record):
+        release_calls.append(record["id"])
+        if record["id"] == "cancelled":
+            raise asyncio.CancelledError("release cancelled")
+        sibling_completed.set()
+
+    service = McpTaskService(
+        repository=SimpleNamespace(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await service._release_claimed_records(
+            [
+                {**_claimed_row(), "id": "cancelled"},
+                {**_claimed_row(), "id": "sibling"},
+            ],
+            release=release,
+        )
+
+    assert sibling_completed.is_set()
+    assert release_calls.count("cancelled") == 1
+    assert release_calls.count("sibling") == 1
+    cancellations = [record for record in caplog.records if "MCP task claim release was cancelled" in record.getMessage()]
+    assert len(cancellations) == 1
+    assert "task_id=cancelled" in cancellations[0].getMessage()
+
+
+@pytest.mark.asyncio
 async def test_duplicate_compensation_registration_logs_failure_once(caplog):
     service = McpTaskService(
         repository=SimpleNamespace(),

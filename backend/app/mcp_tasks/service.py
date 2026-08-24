@@ -687,7 +687,13 @@ class McpTaskService:
             )
             for record in records
         ]
-        await asyncio.gather(*release_tasks, return_exceptions=True)
+        results = await asyncio.gather(*release_tasks, return_exceptions=True)
+        for record, result in zip(records, results, strict=True):
+            if isinstance(result, asyncio.CancelledError):
+                logger.error(
+                    "MCP task claim release was cancelled (task_id=%s)",
+                    record.get("id"),
+                )
 
     async def _release_cancel_after_cancellation(self, record: dict[str, Any]) -> None:
         await self._drain_cancellation_compensation(
