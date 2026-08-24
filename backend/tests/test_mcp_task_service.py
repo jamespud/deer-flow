@@ -2810,3 +2810,252 @@ async def test_notification_outer_cancellation_releases_started_and_never_starte
     assert sorted(task_id for task_id, _kwargs in repo.notification_releases) == ["task-1", "task-2"]
     assert launch_calls == ["task-1"]
     release_gate.set()
+
+
+class SuppressingBatchDriver(FakeDriver):
+    def __init__(self, *, release_gate):
+        super().__init__()
+        self.release_gate = release_gate
+        self.started = asyncio.Event()
+        self.swallowed = asyncio.Event()
+
+    async def _run(self, task):
+        if task.local_task_id == "task-1":
+            self.started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.swallowed.set()
+                await self.release_gate.wait()
+        if task.local_task_id == "task-1":
+            return TaskSnapshot(status=TaskStatus.WORKING)
+        return TaskSnapshot(status=TaskStatus.WORKING)
+
+    async def get_status(self, task):
+        return await self._run(task)
+
+    async def cancel(self, task):
+        return await self._run(task)
+
+
+def _batch_probe_rows(*, notification=False, count=2):
+    rows = []
+    for index in range(count):
+        row = {
+            **_claimed_row(),
+            "id": f"task-{index + 1}",
+            "remote_task_id": f"remote-{index + 1}",
+        }
+        if notification:
+            row.update(
+                notification_status="claimed",
+                dispatch_version=1,
+                dispatch_attempt=0,
+                dispatch_event={"status": "completed"},
+            )
+        rows.append(row)
+    return rows
+
+
+async def _run_batch_probe(service, phase):
+    now = datetime.now(UTC)
+    if phase == "poll":
+        await service.run_once(now=now)
+    elif phase == "cancel":
+        await service._run_cancellations(now=now)
+    else:
+        await service._run_notifications(now=now)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["poll", "cancel", "notification"])
+async def test_outer_cancel_returns_before_suppressing_child_and_releases_all_once(phase, monkeypatch):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.05)
+    release_gate = asyncio.Event()
+    driver = SuppressingBatchDriver(release_gate=release_gate)
+
+    if phase == "notification":
+        repo = BatchNotificationRepository(_batch_probe_rows(notification=True))
+
+        async def launch_notification(**kwargs):
+            if kwargs["task_id"] == "task-1":
+                driver.started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    driver.swallowed.set()
+                    await release_gate.wait()
+            return {"run_id": f"notify-{kwargs['task_id']}"}
+
+        service = McpTaskService(
+            repository=repo,
+            drivers=McpTaskDriverRegistry(),
+            poll_interval_seconds=5,
+            lease_seconds=120,
+            max_concurrent_polls=3,
+            launch_notification=launch_notification,
+            get_run=AsyncMock(return_value=None),
+        )
+    else:
+        repo = BatchCancellationRepository(_batch_probe_rows(), phase=phase)
+        drivers = McpTaskDriverRegistry()
+        drivers.register("fake", driver)
+        service = McpTaskService(
+            repository=repo,
+            drivers=drivers,
+            poll_interval_seconds=5,
+            lease_seconds=120,
+            max_concurrent_polls=3,
+        )
+
+    caller = asyncio.create_task(_run_batch_probe(service, phase))
+    await driver.started.wait()
+    caller.cancel("first cancellation")
+    timed_out = False
+    try:
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await asyncio.wait_for(caller, timeout=0.2)
+        assert caught.value.args == ("first cancellation",)
+    except TimeoutError:
+        timed_out = True
+
+    assert timed_out is False
+    assert driver.swallowed.is_set()
+    if phase == "poll":
+        released = repo.released
+    elif phase == "cancel":
+        released = repo.cancel_releases
+    else:
+        released = repo.notification_releases
+    assert sorted(task_id for task_id, _kwargs in released) == ["task-1", "task-2"]
+    assert len(service._compensation_tasks) == 1
+
+    release_gate.set()
+    await _wait_for_compensation_tasks_to_clear(service)
+    assert len(released) == 2
+
+
+@pytest.mark.asyncio
+async def test_started_child_swallowing_cancel_then_returning_still_releases_once(monkeypatch):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.05)
+    release_gate = asyncio.Event()
+    driver = SuppressingBatchDriver(release_gate=release_gate)
+    repo = BatchCancellationRepository([_claimed_row()], phase="poll")
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", driver)
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    caller = asyncio.create_task(service.run_once(now=datetime.now(UTC)))
+    await driver.started.wait()
+    caller.cancel("first cancellation")
+    await driver.swallowed.wait()
+    assert repo.released == []
+    release_gate.set()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await caller
+    assert caught.value.args == ("first cancellation",)
+    assert [task_id for task_id, _kwargs in repo.released] == ["task-1"]
+    await _wait_for_compensation_tasks_to_clear(service)
+
+
+@pytest.mark.asyncio
+async def test_repeated_batch_cancel_preserves_first_cancel_args(monkeypatch):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.05)
+    release_gate = asyncio.Event()
+    driver = SuppressingBatchDriver(release_gate=release_gate)
+    repo = BatchCancellationRepository([_claimed_row()], phase="poll")
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", driver)
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    caller = asyncio.create_task(service.run_once(now=datetime.now(UTC)))
+    await driver.started.wait()
+    caller.cancel("first cancellation")
+    await driver.swallowed.wait()
+    caller.cancel("second cancellation")
+
+    try:
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await asyncio.wait_for(caller, timeout=0.2)
+        assert caught.value.args == ("first cancellation",)
+    finally:
+        release_gate.set()
+        if not caller.done():
+            with pytest.raises(asyncio.CancelledError):
+                await caller
+
+
+@pytest.mark.asyncio
+async def test_batch_outer_cancel_releases_duplicate_ids_by_position(monkeypatch):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.05)
+    release_gate = asyncio.Event()
+    driver = SuppressingBatchDriver(release_gate=release_gate)
+    rows = [_claimed_row(), _claimed_row()]
+    repo = BatchCancellationRepository(rows, phase="poll")
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", driver)
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    caller = asyncio.create_task(service.run_once(now=datetime.now(UTC)))
+    await driver.started.wait()
+    caller.cancel("first cancellation")
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, timeout=0.2)
+
+    assert [task_id for task_id, _kwargs in repo.released] == ["task-1", "task-1"]
+    release_gate.set()
+    await _wait_for_compensation_tasks_to_clear(service)
+
+
+@pytest.mark.asyncio
+async def test_batch_completion_cancel_race_releases_once_for_100_rounds():
+    service = McpTaskService(
+        repository=SimpleNamespace(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    release_calls = []
+
+    async def operation(_record):
+        await asyncio.sleep(0)
+        return None
+
+    async def release(record):
+        release_calls.append(record["position"])
+
+    for position in range(100):
+        caller = asyncio.create_task(
+            service._run_claimed_batch(
+                [{"id": "duplicate", "position": position}],
+                operation=operation,
+                release=release,
+                action="race",
+            )
+        )
+        await asyncio.sleep(0)
+        caller.cancel("race cancellation")
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+    assert sorted(release_calls) == list(range(100))

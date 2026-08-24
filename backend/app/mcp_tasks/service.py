@@ -6,6 +6,7 @@ import logging
 import socket
 import uuid
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -40,14 +41,25 @@ _CANCELLATION_DRAIN_TIMEOUT_SECONDS = 5.0
 @dataclass(slots=True)
 class _BatchRecordState:
     record: dict[str, Any]
-    cancellation_release_owned: bool = False
-    cancellation_release_started: bool = False
+    release_started: bool = False
+    ordinary_release_handled: bool = False
 
-    def claim_cancellation_release(self) -> bool:
-        if self.cancellation_release_started:
+    def claim_release(self) -> bool:
+        if self.release_started:
             return False
-        self.cancellation_release_started = True
+        self.release_started = True
         return True
+
+
+@dataclass(slots=True)
+class _BatchState:
+    cancellation_requested: bool = False
+
+
+_current_batch_record: ContextVar[_BatchRecordState | None] = ContextVar(
+    "mcp_task_current_batch_record",
+    default=None,
+)
 
 
 def _bound_error(error: str | None) -> str | None:
@@ -109,6 +121,17 @@ class McpTaskService:
     @property
     def tracking_degraded_after_errors(self) -> int:
         return self._tracking_degraded_after_errors
+
+    @staticmethod
+    def _claim_batch_ordinary_release() -> bool:
+        state = _current_batch_record.get()
+        if state is None:
+            return False
+        if state.release_started:
+            return True
+        state.ordinary_release_handled = True
+        state.release_started = True
+        return False
 
     async def submit(
         self,
@@ -297,7 +320,7 @@ class McpTaskService:
         *,
         release: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
-        if not state.claim_cancellation_release():
+        if not state.claim_release():
             return
         try:
             await release(state.record)
@@ -314,42 +337,42 @@ class McpTaskService:
                 state.record.get("id"),
             )
 
-    async def _drain_batch_tasks(
+    async def _finish_cancelled_batch(
         self,
-        tasks: list[asyncio.Task[Any]],
-        *,
-        action: str,
-    ) -> None:
-        if not tasks:
-            return
-        completion = asyncio.gather(*tasks, return_exceptions=True)
-        deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
-        if await wait_for_task_until(completion, deadline=deadline):
-            return
-        self._track_compensation_task(
-            completion,
-            action=f"settle {action} batch",
-            task_id="batch",
-        )
-        logger.warning(
-            "Timed out after %.1f seconds waiting for MCP task %s batch children; they continue in the background",
-            _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
-            action,
-        )
-
-    async def _release_unowned_batch_states(
-        self,
+        supervisor: asyncio.Task[list[Any]],
+        children: list[asyncio.Task[Any]],
         states: list[_BatchRecordState],
         *,
         release: Callable[[dict[str, Any]], Awaitable[None]],
+        action: str,
     ) -> None:
-        fallback: list[dict[str, Any]] = []
-        for state in states:
-            if state.cancellation_release_owned or not state.claim_cancellation_release():
-                continue
-            fallback.append(state.record)
-        if fallback:
-            await self._release_claimed_records(fallback, release=release)
+        # The handoff owns both the supervisor and every release task. Keeping
+        # all of them in this frame lets a timed-out handoff finish safely in
+        # the background without starting a second release.
+        async def release_uncompleted(state: _BatchRecordState) -> None:
+            if state.ordinary_release_handled:
+                return
+            await self._release_owned_batch_record(state, release=release)
+
+        release_tasks = [
+            asyncio.create_task(
+                release_uncompleted(state),
+                name=f"mcp-{action.replace(' ', '-')}-release-{index}-{state.record.get('id', 'unknown')}",
+            )
+            for index, state in enumerate(states)
+        ]
+        results = await asyncio.gather(supervisor, *release_tasks, return_exceptions=True)
+        supervisor_result = results[0]
+        if isinstance(supervisor_result, BaseException):
+            logger.error(
+                "MCP task batch supervisor failed during cancellation handoff (action=%s): %s",
+                action,
+                supervisor_result,
+                exc_info=(type(supervisor_result), supervisor_result, supervisor_result.__traceback__),
+            )
+        for child in children:
+            if child.done():
+                _consume_task_error(child)
 
     async def _run_claimed_batch(
         self,
@@ -360,16 +383,24 @@ class McpTaskService:
         action: str,
     ) -> tuple[list[_BatchRecordState], list[Any]]:
         states = [_BatchRecordState(record) for record in records]
+        batch_state = _BatchState()
+        parent_task = asyncio.current_task()
 
         async def run_one(state: _BatchRecordState) -> Any:
-            # This is the first coroutine step, so a task cancelled before it
-            # reaches here remains eligible for the batch fallback.
-            state.cancellation_release_owned = True
+            context_token = _current_batch_record.set(state)
             try:
+                if parent_task is not None and parent_task.cancelling():
+                    batch_state.cancellation_requested = True
+                if batch_state.cancellation_requested:
+                    return None
                 return await operation(state.record)
             except asyncio.CancelledError:
                 await self._release_owned_batch_record(state, release=release)
                 raise
+            finally:
+                _current_batch_record.reset(context_token)
+                if batch_state.cancellation_requested:
+                    await self._release_owned_batch_record(state, release=release)
 
         task_prefix = action.replace(" ", "-")
         tasks = [
@@ -379,14 +410,42 @@ class McpTaskService:
             )
             for index, state in enumerate(states)
         ]
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-        except asyncio.CancelledError:
-            await self._drain_batch_tasks(tasks, action=action)
-            await self._release_unowned_batch_states(states, release=release)
-            raise
 
-        await self._release_unowned_batch_states(states, release=release)
+        async def supervise() -> list[Any]:
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+        supervisor = asyncio.create_task(
+            supervise(),
+            name=f"mcp-{task_prefix}-supervisor",
+        )
+        try:
+            results = await asyncio.shield(supervisor)
+        except asyncio.CancelledError as original_cancel:
+            batch_state.cancellation_requested = True
+            for task in tasks:
+                task.cancel()
+            handoff = asyncio.create_task(
+                self._finish_cancelled_batch(
+                    supervisor,
+                    tasks,
+                    states,
+                    release=release,
+                    action=action,
+                ),
+                name=f"mcp-{task_prefix}-cancellation-handoff",
+            )
+            await self._drain_cancellation_task(
+                handoff,
+                action=f"finish {action} batch handoff",
+                task_id="batch",
+                deadline=asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+            )
+            # A task that was cancelled before entering this handler stores a
+            # special cancelled state; raising that same exception object can
+            # make asyncio discard its message when the task is awaited.
+            # Recreate it with the first cancellation's args instead.
+            raise asyncio.CancelledError(*original_cancel.args)
+
         return states, results
 
     async def run_once(self, *, now: datetime) -> None:
@@ -537,6 +596,8 @@ class McpTaskService:
             attempts = max(0, int(record.get("cancel_attempt_count") or 1) - 1)
             retry_seconds = min(self._poll_interval_seconds * (2 ** min(attempts, 16)), self._max_poll_backoff_seconds)
             failed_at = datetime.now(UTC)
+            if self._claim_batch_ordinary_release():
+                return
             await self._repository.release_cancel_claim(
                 record["id"],
                 lease_owner=self._lease_owner,
@@ -666,6 +727,8 @@ class McpTaskService:
             )
             return
         except ConflictError as exc:
+            if self._claim_batch_ordinary_release():
+                return
             await self._repository.release_notification_claim(
                 task_id,
                 lease_owner=self._lease_owner,
@@ -675,6 +738,8 @@ class McpTaskService:
             )
             return
         except Exception as exc:  # noqa: BLE001 - retry the same idempotency key
+            if self._claim_batch_ordinary_release():
+                return
             await self._repository.release_notification_claim(
                 task_id,
                 lease_owner=self._lease_owner,
@@ -884,6 +949,8 @@ class McpTaskService:
         driver_name = str(record.get("driver_name") or "")
         driver = self._drivers.get(driver_name)
         if driver is None:
+            if self._claim_batch_ordinary_release():
+                return
             await self._release_after_error(
                 record,
                 now=now,
@@ -914,6 +981,8 @@ class McpTaskService:
                 driver_name,
                 exc_info=True,
             )
+            if self._claim_batch_ordinary_release():
+                return
             await self._release_after_error(record, now=polled_at, error=str(exc) or type(exc).__name__)
             return
 
