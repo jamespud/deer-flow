@@ -255,6 +255,8 @@ class RunManager:
         self._orphan_recovery_task: asyncio.Task[None] | None = None
         self._heartbeat_cancel_requested = False
         self._orphan_recovery_cancel_requested = False
+        self._lock_waiters: set[asyncio.Task[bool]] = set()
+        self._lock_waiter_cancel_requested: set[asyncio.Task[bool]] = set()
         self._cancellation_cleanup_tasks: set[asyncio.Future[None]] = set()
         self._cancellation_cleanup_producers: set[object] = set()
         self._cancellation_cleanup_state_changed = asyncio.Event()
@@ -372,32 +374,69 @@ class RunManager:
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
 
-    async def _cancel_and_settle_lock_waiter(self, waiter: asyncio.Task[bool]) -> bool:
-        """Cancel a manager-lock waiter and settle it despite caller cancellation."""
-        if not waiter.done():
-            waiter.cancel()
-        while not waiter.done():
-            try:
-                await asyncio.shield(waiter)
-            except asyncio.CancelledError:
-                # A second cancellation must not leave the lock waiter owned by
-                # the event loop after shutdown has already returned.
-                continue
-            except BaseException:
-                break
-        if waiter.cancelled():
-            return False
+    def _observe_lock_waiter_result(self, waiter: asyncio.Task[bool], *, late: bool) -> bool:
+        self._lock_waiter_cancel_requested.discard(waiter)
         try:
-            return waiter.result()
-        except asyncio.CancelledError:
+            return bool(waiter.result())
+        except asyncio.CancelledError as exc:
+            if late:
+                logger.warning(
+                    "Manager lock waiter was cancelled while settling in the background (task=%s): %s",
+                    waiter.get_name(),
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
             return False
-        except BaseException as exc:  # noqa: BLE001 - do not replace caller cancellation
+        except BaseException as exc:  # noqa: BLE001 - consume late waiter failures
             logger.warning(
-                "Manager lock acquisition waiter failed while settling: %s",
+                "Manager lock waiter failed while settling%s (task=%s): %s",
+                " in the background" if late else "",
+                waiter.get_name(),
                 exc,
                 exc_info=(type(exc), exc, exc.__traceback__),
             )
             return False
+
+    def _lock_waiter_done(self, waiter: asyncio.Task[bool]) -> None:
+        if waiter not in self._lock_waiters:
+            return
+        self._lock_waiters.discard(waiter)
+        acquired = self._observe_lock_waiter_result(waiter, late=True)
+        if not acquired:
+            return
+        try:
+            self._lock.release()
+        except RuntimeError as exc:
+            logger.warning(
+                "Late manager lock waiter acquired an already-unlocked manager lock (task=%s): %s",
+                waiter.get_name(),
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    def _track_lock_waiter(self, waiter: asyncio.Task[bool]) -> None:
+        if waiter in self._lock_waiters:
+            return
+        self._lock_waiters.add(waiter)
+        waiter.add_done_callback(self._lock_waiter_done)
+        logger.warning(
+            "Manager lock waiter did not settle before the deadline; continuing in the background (task=%s)",
+            waiter.get_name(),
+        )
+
+    def _cancel_lock_waiter_once(self, waiter: asyncio.Task[bool]) -> None:
+        if waiter.done() or waiter in self._lock_waiter_cancel_requested:
+            return
+        self._lock_waiter_cancel_requested.add(waiter)
+        waiter.cancel()
+
+    async def _cancel_and_settle_lock_waiter(self, waiter: asyncio.Task[bool], *, deadline: float) -> bool:
+        """Cancel one lock waiter and settle it within the caller's deadline."""
+        self._cancel_lock_waiter_once(waiter)
+        if not await wait_for_task_until(waiter, deadline=deadline):
+            self._track_lock_waiter(waiter)
+            return False
+        return self._observe_lock_waiter_result(waiter, late=False)
 
     async def _acquire_lock_until(self, deadline: float) -> bool:
         """Acquire the manager lock without exceeding an absolute deadline."""
@@ -409,12 +448,13 @@ class RunManager:
         try:
             done, _ = await asyncio.wait((waiter,), timeout=remaining)
         except asyncio.CancelledError:
-            acquired = await self._cancel_and_settle_lock_waiter(waiter)
+            acquired = await self._cancel_and_settle_lock_waiter(waiter, deadline=deadline)
             if acquired:
                 self._lock.release()
             raise
 
         if waiter in done:
+            self._lock_waiter_cancel_requested.discard(waiter)
             try:
                 acquired = waiter.result()
             except asyncio.CancelledError:
@@ -424,7 +464,7 @@ class RunManager:
                 return False
             return acquired
 
-        acquired = await self._cancel_and_settle_lock_waiter(waiter)
+        acquired = await self._cancel_and_settle_lock_waiter(waiter, deadline=deadline)
         if acquired and asyncio.get_running_loop().time() >= deadline:
             self._lock.release()
             return False

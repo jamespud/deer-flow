@@ -150,6 +150,35 @@ class FailingFinalizationRunStore(MemoryRunStore):
         raise RuntimeError("finalization unavailable")
 
 
+class CancellationResistantLock:
+    def __init__(self, outcome: str = "acquired") -> None:
+        self.acquire_started = asyncio.Event()
+        self.allow_acquire = asyncio.Event()
+        self.outcome = outcome
+        self.cancel_count = 0
+        self.release_count = 0
+        self.acquired = False
+
+    async def acquire(self) -> bool:
+        self.acquire_started.set()
+        try:
+            await self.allow_acquire.wait()
+        except asyncio.CancelledError:
+            self.cancel_count += 1
+            await self.allow_acquire.wait()
+        if self.outcome == "exception":
+            raise RuntimeError("late lock waiter failure")
+        if self.outcome == "cancelled":
+            raise asyncio.CancelledError("late lock waiter cancellation")
+        self.acquired = True
+        return True
+
+    def release(self) -> None:
+        assert self.acquired
+        self.acquired = False
+        self.release_count += 1
+
+
 async def _stored_statuses(store: MemoryRunStore, *run_ids: str) -> dict[str, Any]:
     rows = {}
     for run_id in run_ids:
@@ -697,7 +726,116 @@ async def test_shutdown_bounds_initial_manager_lock_wait(caplog: pytest.LogCaptu
     assert "could not acquire manager lock" in caplog.text
     await asyncio.wait_for(manager._lock.acquire(), timeout=0.1)
     manager._lock.release()
+    await asyncio.sleep(0)
     assert not getattr(manager._lock, "_waiters", ())
+
+
+@pytest.mark.anyio
+async def test_lock_waiter_settlement_has_absolute_deadline_and_tracks_late_acquire():
+    manager = RunManager()
+    lock = CancellationResistantLock()
+    manager._lock = lock
+    loop = asyncio.get_running_loop()
+
+    waiter_task = asyncio.create_task(manager._acquire_lock_until(loop.time() + 0.02))
+    await lock.acquire_started.wait()
+    started = loop.time()
+
+    result = await asyncio.wait_for(asyncio.shield(waiter_task), timeout=0.2)
+
+    assert result is False
+    assert loop.time() - started < 0.1
+    assert lock.cancel_count == 1
+    assert len(manager._lock_waiters) == 1
+
+    lock.allow_acquire.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert lock.release_count == 1
+    assert not manager._lock_waiters
+
+
+@pytest.mark.anyio
+async def test_repeated_lock_waiter_cancellation_preserves_original_signal_and_deadline():
+    manager = RunManager()
+    lock = CancellationResistantLock()
+    manager._lock = lock
+    loop = asyncio.get_running_loop()
+    waiter_task = asyncio.create_task(manager._acquire_lock_until(loop.time() + 0.03))
+    await lock.acquire_started.wait()
+
+    started = loop.time()
+    waiter_task.cancel("first cancellation")
+    await asyncio.sleep(0)
+    waiter_task.cancel("second cancellation")
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await asyncio.wait_for(waiter_task, timeout=0.2)
+
+    assert caught.value.args == ("first cancellation",)
+    assert loop.time() - started < 0.1
+    assert lock.cancel_count == 1
+    assert len(manager._lock_waiters) == 1
+
+    lock.allow_acquire.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert lock.release_count == 1
+    assert not manager._lock_waiters
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("outcome", ["exception", "cancelled"])
+async def test_late_lock_waiter_outcome_is_observed_once(outcome, caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    lock = CancellationResistantLock(outcome)
+    manager._lock = lock
+    loop = asyncio.get_running_loop()
+
+    with caplog.at_level(logging.WARNING):
+        result = await manager._acquire_lock_until(loop.time() + 0.02)
+
+    assert result is False
+    assert len(manager._lock_waiters) == 1
+    waiter = next(iter(manager._lock_waiters))
+    lock.allow_acquire.set()
+    if outcome == "exception":
+        with pytest.raises(RuntimeError, match="late lock waiter failure"):
+            await asyncio.wait_for(asyncio.shield(waiter), timeout=0.2)
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(waiter), timeout=0.2)
+    await asyncio.sleep(0)
+
+    assert not manager._lock_waiters
+    assert "Manager lock waiter" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_lock_waiter_same_tick_timeout_releases_at_most_once(monkeypatch: pytest.MonkeyPatch):
+    manager = RunManager()
+    lock = CancellationResistantLock()
+    manager._lock = lock
+
+    async def settle(_waiter, *, deadline):
+        _waiter.cancel()
+        lock.allow_acquire.set()
+        lock.acquired = True
+        return True
+
+    monkeypatch.setattr(manager, "_cancel_and_settle_lock_waiter", settle)
+    result = await manager._acquire_lock_until(asyncio.get_running_loop().time() - 1)
+
+    assert result is False
+    assert lock.release_count == 0
+
+    # Exercise the timeout branch with an already-expired deadline while the
+    # waiter is still pending in a controlled same-tick race.
+    result = await manager._acquire_lock_until(asyncio.get_running_loop().time() + 0.001)
+    assert result is False
+    assert lock.release_count == 1
+    assert lock.acquired is False
 
 
 @pytest.mark.anyio

@@ -6,7 +6,7 @@ import logging
 import socket
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -35,6 +35,19 @@ _MAX_PERSISTED_ERROR_CHARS = 4_000
 _MAX_INPUT_REQUIRED_BYTES = 65_536
 _MAX_NOTIFICATION_ATTEMPTS = 5
 _CANCELLATION_DRAIN_TIMEOUT_SECONDS = 5.0
+
+
+@dataclass(slots=True)
+class _BatchRecordState:
+    record: dict[str, Any]
+    cancellation_release_owned: bool = False
+    cancellation_release_started: bool = False
+
+    def claim_cancellation_release(self) -> bool:
+        if self.cancellation_release_started:
+            return False
+        self.cancellation_release_started = True
+        return True
 
 
 def _bound_error(error: str | None) -> str | None:
@@ -278,6 +291,104 @@ class McpTaskService:
             deadline=deadline,
         )
 
+    async def _release_owned_batch_record(
+        self,
+        state: _BatchRecordState,
+        *,
+        release: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        if not state.claim_cancellation_release():
+            return
+        try:
+            await release(state.record)
+        except asyncio.CancelledError as exc:
+            logger.error(
+                "MCP task batch cancellation release was cancelled (task_id=%s): %s",
+                state.record.get("id"),
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+        except Exception:  # noqa: BLE001 - preserve the child's cancellation
+            logger.exception(
+                "Unexpected MCP task batch cancellation release failure (task_id=%s)",
+                state.record.get("id"),
+            )
+
+    async def _drain_batch_tasks(
+        self,
+        tasks: list[asyncio.Task[Any]],
+        *,
+        action: str,
+    ) -> None:
+        if not tasks:
+            return
+        completion = asyncio.gather(*tasks, return_exceptions=True)
+        deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+        if await wait_for_task_until(completion, deadline=deadline):
+            return
+        self._track_compensation_task(
+            completion,
+            action=f"settle {action} batch",
+            task_id="batch",
+        )
+        logger.warning(
+            "Timed out after %.1f seconds waiting for MCP task %s batch children; they continue in the background",
+            _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+            action,
+        )
+
+    async def _release_unowned_batch_states(
+        self,
+        states: list[_BatchRecordState],
+        *,
+        release: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        fallback: list[dict[str, Any]] = []
+        for state in states:
+            if state.cancellation_release_owned or not state.claim_cancellation_release():
+                continue
+            fallback.append(state.record)
+        if fallback:
+            await self._release_claimed_records(fallback, release=release)
+
+    async def _run_claimed_batch(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        operation: Callable[[dict[str, Any]], Awaitable[Any]],
+        release: Callable[[dict[str, Any]], Awaitable[None]],
+        action: str,
+    ) -> tuple[list[_BatchRecordState], list[Any]]:
+        states = [_BatchRecordState(record) for record in records]
+
+        async def run_one(state: _BatchRecordState) -> Any:
+            # This is the first coroutine step, so a task cancelled before it
+            # reaches here remains eligible for the batch fallback.
+            state.cancellation_release_owned = True
+            try:
+                return await operation(state.record)
+            except asyncio.CancelledError:
+                await self._release_owned_batch_record(state, release=release)
+                raise
+
+        task_prefix = action.replace(" ", "-")
+        tasks = [
+            asyncio.create_task(
+                run_one(state),
+                name=f"mcp-{task_prefix}-{index}-{state.record.get('id', 'unknown')}",
+            )
+            for index, state in enumerate(states)
+        ]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            await self._drain_batch_tasks(tasks, action=action)
+            await self._release_unowned_batch_states(states, release=release)
+            raise
+
+        await self._release_unowned_batch_states(states, release=release)
+        return states, results
+
     async def run_once(self, *, now: datetime) -> None:
         await self._run_cancellations(now=now)
 
@@ -292,22 +403,19 @@ class McpTaskService:
             release=self._release_poll_after_cancellation,
         )
         if claimed:
-            try:
-                results = await asyncio.gather(
-                    *(self._poll_one(task, now=now) for task in claimed),
-                    return_exceptions=True,
-                )
-                for record, result in zip(claimed, results, strict=True):
-                    if isinstance(result, BaseException):
-                        logger.error(
-                            "Unexpected MCP task poll failure (task_id=%s); the lease will expire for recovery",
-                            record.get("id"),
-                            exc_info=(type(result), result, result.__traceback__),
-                        )
-            except asyncio.CancelledError:
-                for record in claimed:
-                    await self._release_poll_after_cancellation(record)
-                raise
+            states, results = await self._run_claimed_batch(
+                claimed,
+                operation=lambda record: self._poll_one_claimed(record, now=now),
+                release=self._release_poll_after_cancellation,
+                action="poll",
+            )
+            for state, result in zip(states, results, strict=True):
+                if isinstance(result, BaseException):
+                    logger.error(
+                        "Unexpected MCP task poll failure (task_id=%s); the lease will expire for recovery",
+                        state.record.get("id"),
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
 
         await self._run_notifications(now=datetime.now(UTC))
 
@@ -383,22 +491,19 @@ class McpTaskService:
             release=self._release_cancel_after_cancellation,
         )
         if records:
-            try:
-                results = await asyncio.gather(
-                    *(self._cancel_one(record) for record in records),
-                    return_exceptions=True,
-                )
-                for record, result in zip(records, results, strict=True):
-                    if isinstance(result, BaseException):
-                        logger.error(
-                            "Unexpected MCP task cancellation failure (task_id=%s); the lease will expire for recovery",
-                            record.get("id"),
-                            exc_info=(type(result), result, result.__traceback__),
-                        )
-            except asyncio.CancelledError:
-                for record in records:
-                    await self._release_cancel_after_cancellation(record)
-                raise
+            states, results = await self._run_claimed_batch(
+                records,
+                operation=self._cancel_one_claimed,
+                release=self._release_cancel_after_cancellation,
+                action="cancel",
+            )
+            for state, result in zip(states, results, strict=True):
+                if isinstance(result, BaseException):
+                    logger.error(
+                        "Unexpected MCP task cancellation failure (task_id=%s); the lease will expire for recovery",
+                        state.record.get("id"),
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
 
     async def _cancel_one(self, record: dict[str, Any]) -> None:
         try:
@@ -454,37 +559,23 @@ class McpTaskService:
             release=self._release_notification_after_cancellation,
         )
         if records:
-            try:
-                results = await asyncio.gather(
-                    *(self._notify_one(record, now=now) for record in records),
-                    return_exceptions=True,
+            states, results = await self._run_claimed_batch(
+                records,
+                operation=lambda record: self._notify_one_claimed(record, now=now),
+                release=self._release_notification_after_cancellation,
+                action="notification",
+            )
+            for state, result in zip(states, results, strict=True):
+                if not isinstance(result, BaseException) or isinstance(result, asyncio.CancelledError):
+                    continue
+                record = state.record
+                error = _bound_error(str(result) or type(result).__name__) or type(result).__name__
+                logger.error(
+                    "Unexpected MCP task notification failure (task_id=%s)",
+                    record.get("id"),
+                    exc_info=(type(result), result, result.__traceback__),
                 )
-                for record, result in zip(records, results, strict=True):
-                    if not isinstance(result, BaseException):
-                        continue
-                    error = _bound_error(str(result) or type(result).__name__) or type(result).__name__
-                    logger.error(
-                        "Unexpected MCP task notification failure (task_id=%s)",
-                        record.get("id"),
-                        exc_info=(type(result), result, result.__traceback__),
-                    )
-                    try:
-                        await self._repository.release_notification_lease(
-                            record["id"],
-                            lease_owner=self._lease_owner,
-                            next_notification_at=now + timedelta(seconds=self._notification_retry_seconds(record)),
-                            error=error,
-                            count_failure=True,
-                        )
-                    except Exception:  # noqa: BLE001 - retain the original task-scoped failure
-                        logger.exception(
-                            "Failed to release MCP task notification lease (task_id=%s)",
-                            record.get("id"),
-                        )
-            except asyncio.CancelledError:
-                for record in records:
-                    await self._release_notification_after_cancellation(record)
-                raise
+                await self._release_notification_failure(record, now=now, error=error)
 
     async def _notify_one(self, record: dict[str, Any], *, now: datetime) -> None:
         try:
@@ -690,13 +781,59 @@ class McpTaskService:
             )
             for record in records
         ]
-        results = await asyncio.gather(*release_tasks, return_exceptions=True)
+        completion = asyncio.gather(*release_tasks, return_exceptions=True)
+        deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+        if not await wait_for_task_until(completion, deadline=deadline):
+            self._track_compensation_task(
+                completion,
+                action="release claimed MCP task batch",
+                task_id="batch",
+            )
+            logger.warning(
+                "Timed out after %.1f seconds waiting for MCP task claim releases; they continue in the background",
+                _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+            )
+            return
+        results = completion.result()
         for record, result in zip(records, results, strict=True):
             if isinstance(result, asyncio.CancelledError):
                 logger.error(
                     "MCP task claim release was cancelled (task_id=%s)",
                     record.get("id"),
                 )
+
+    async def _release_notification_failure(
+        self,
+        record: dict[str, Any],
+        *,
+        now: datetime,
+        error: str,
+    ) -> None:
+        task = asyncio.create_task(
+            self._repository.release_notification_lease(
+                record["id"],
+                lease_owner=self._lease_owner,
+                next_notification_at=now + timedelta(seconds=self._notification_retry_seconds(record)),
+                error=error,
+                count_failure=True,
+            ),
+            name=f"mcp-release-notification-failure-{record.get('id', 'unknown')}",
+        )
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await self._drain_cancellation_task(
+                task,
+                action="release notification failure",
+                task_id=record["id"],
+                deadline=asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+            )
+            raise
+        except Exception:  # noqa: BLE001 - retain the task-scoped failure
+            logger.exception(
+                "Failed to release MCP task notification lease (task_id=%s)",
+                record.get("id"),
+            )
 
     async def _release_cancel_after_cancellation(self, record: dict[str, Any]) -> None:
         await self._drain_cancellation_compensation(

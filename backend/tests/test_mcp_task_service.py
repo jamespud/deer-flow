@@ -2133,9 +2133,9 @@ async def test_notification_batch_fallback_release_survives_caller_cancellation(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert repo.release_interrupted is True
+    assert repo.release_interrupted is False
     assert repo.release_completed is True
-    assert len(repo.release_calls) == 2
+    assert len(repo.release_calls) == 1
 
 
 class NotificationPersistenceRepo:
@@ -2598,3 +2598,215 @@ async def test_background_compensation_failure_is_consumed(monkeypatch, caplog):
     assert len(failures) == 1
     assert "release remained unavailable" in failures[0].getMessage()
     assert not service._compensation_tasks
+
+
+class BatchCancellationRepository(FakeRepository):
+    def __init__(self, rows, *, phase="cancel"):
+        super().__init__(rows)
+        self.phase = phase
+        self.cancel_releases = []
+        self.caller_task = None
+
+    async def claim_due_tasks(self, **_kwargs):
+        if self.phase != "poll":
+            return []
+        return [dict(row) for row in self.rows]
+
+    async def claim_cancel_requests(self, **_kwargs):
+        if self.phase != "cancel":
+            return []
+        return [dict(row) for row in self.rows]
+
+    async def release_cancel_claim(self, task_id, **kwargs):
+        self.cancel_releases.append((task_id, kwargs))
+        return True
+
+
+class OuterCancellingDriver(FakeDriver):
+    def __init__(self, *, caller_task, phase):
+        super().__init__()
+        self.caller_task = caller_task
+        self.phase = phase
+        self.started = []
+
+    async def _run(self, task):
+        self.started.append(task.local_task_id)
+        if task.local_task_id != "task-1":
+            raise AssertionError("task-2 should be released by the batch fallback")
+        self.caller_task.cancel()
+        await asyncio.Event().wait()
+
+    async def get_status(self, task):
+        return await self._run(task)
+
+    async def cancel(self, task):
+        return await self._run(task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["poll", "cancel"])
+async def test_batch_outer_cancellation_releases_started_and_never_started_once(phase):
+    rows = [
+        _claimed_row(),
+        {**_claimed_row(), "id": "task-2", "remote_task_id": "remote-2"},
+    ]
+    repo = BatchCancellationRepository(rows, phase=phase)
+    drivers = McpTaskDriverRegistry()
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    caller = asyncio.create_task(service.run_once(now=datetime.now(UTC)) if phase == "poll" else service._run_cancellations(now=datetime.now(UTC)))
+    repo.caller_task = caller
+    driver = OuterCancellingDriver(caller_task=caller, phase=phase)
+    drivers.register("fake", driver)
+
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    released = repo.released if phase == "poll" else repo.cancel_releases
+    assert sorted(task_id for task_id, _kwargs in released) == ["task-1", "task-2"]
+    assert driver.started == ["task-1"]
+
+
+class SelfCancellingDriver(FakeDriver):
+    async def get_status(self, task):
+        raise asyncio.CancelledError("child poll cancelled itself")
+
+    async def cancel(self, task):
+        raise asyncio.CancelledError("child cancel cancelled itself")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["poll", "cancel"])
+async def test_batch_child_self_cancellation_releases_once(phase):
+    repo = BatchCancellationRepository([_claimed_row()], phase=phase)
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", SelfCancellingDriver())
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    if phase == "poll":
+        await service.run_once(now=datetime.now(UTC))
+        assert [task_id for task_id, _kwargs in repo.released] == ["task-1"]
+    else:
+        await service._run_cancellations(now=datetime.now(UTC))
+        assert [task_id for task_id, _kwargs in repo.cancel_releases] == ["task-1"]
+
+
+class SelfCancellingNotificationRepository(FakeRepository):
+    def __init__(self):
+        super().__init__()
+        self.notification_releases = []
+
+    async def claim_notification_work(self, **_kwargs):
+        if self.claimed:
+            return []
+        self.claimed = True
+        return [
+            {
+                **_claimed_row(),
+                "notification_status": "claimed",
+                "dispatch_version": 1,
+                "dispatch_attempt": 0,
+                "dispatch_event": {"status": "completed"},
+            }
+        ]
+
+    async def release_notification_claim(self, task_id, **kwargs):
+        self.notification_releases.append((task_id, kwargs))
+        return True
+
+
+@pytest.mark.asyncio
+async def test_notification_child_self_cancellation_releases_once():
+    repo = SelfCancellingNotificationRepository()
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(side_effect=asyncio.CancelledError("child notification cancelled itself")),
+        get_run=AsyncMock(return_value=None),
+    )
+
+    await service._run_notifications(now=datetime.now(UTC))
+
+    assert [task_id for task_id, _kwargs in repo.notification_releases] == ["task-1"]
+
+
+class BatchNotificationRepository(FakeRepository):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.notification_releases = []
+
+    async def claim_notification_work(self, **_kwargs):
+        if self.claimed:
+            return []
+        self.claimed = True
+        return [dict(row) for row in self.rows]
+
+    async def release_notification_claim(self, task_id, **kwargs):
+        self.notification_releases.append((task_id, kwargs))
+        return True
+
+
+@pytest.mark.asyncio
+async def test_notification_outer_cancellation_releases_started_and_never_started_once():
+    rows = [
+        {
+            **_claimed_row(),
+            "notification_status": "claimed",
+            "dispatch_version": 1,
+            "dispatch_attempt": 0,
+            "dispatch_event": {"status": "completed"},
+        },
+        {
+            **_claimed_row(),
+            "id": "task-2",
+            "remote_task_id": "remote-2",
+            "notification_status": "claimed",
+            "dispatch_version": 1,
+            "dispatch_attempt": 0,
+            "dispatch_event": {"status": "completed"},
+        },
+    ]
+    repo = BatchNotificationRepository(rows)
+    caller = None
+    release_gate = asyncio.Event()
+    launch_calls = []
+
+    async def launch_notification(**kwargs):
+        launch_calls.append(kwargs["task_id"])
+        if kwargs["task_id"] != "task-1":
+            raise AssertionError("task-2 should be released by the batch fallback")
+        caller.cancel()
+        await release_gate.wait()
+        return {"run_id": "notify-run-1"}
+
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=launch_notification,
+        get_run=AsyncMock(return_value=None),
+    )
+    caller = asyncio.create_task(service._run_notifications(now=datetime.now(UTC)))
+
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    assert sorted(task_id for task_id, _kwargs in repo.notification_releases) == ["task-1", "task-2"]
+    assert launch_calls == ["task-1"]
+    release_gate.set()
