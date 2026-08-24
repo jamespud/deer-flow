@@ -3422,3 +3422,84 @@ async def test_same_tick_outer_cancellation_wins_over_inner_ordinary_release(cap
     assert repo.release_calls == ["task-1"]
     assert repo.release_finished.is_set()
     assert not service._compensation_tasks
+
+
+class SelfCancellingClaimRepository:
+    def __init__(self):
+        self.claim_started = asyncio.Event()
+        self.claim_calls = 0
+        self.release_calls = []
+
+    async def claim_due_tasks(self, **_kwargs):
+        self.claim_calls += 1
+        self.claim_started.set()
+        raise asyncio.CancelledError("poll claim cancelled itself")
+
+    async def release_claim(self, task_id, **kwargs):
+        self.release_calls.append((task_id, kwargs))
+        return True
+
+
+@pytest.mark.asyncio
+async def test_inner_claim_cancellation_does_not_kill_poller_or_handoff(caplog):
+    repo = SelfCancellingClaimRepository()
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    handoff = AsyncMock()
+    service._finish_cancelled_claim_handoff = handoff
+
+    try:
+        with caplog.at_level(logging.ERROR):
+            await service.start()
+            await repo.claim_started.wait()
+            async with asyncio.timeout(1):
+                while not any("MCP task claim operation failed" in record.message for record in caplog.records):
+                    await asyncio.sleep(0)
+
+        assert service._task is not None
+        assert not service._task.done()
+        assert repo.claim_calls == 1
+        assert repo.release_calls == []
+        handoff.assert_not_awaited()
+        claim_logs = [record for record in caplog.records if "MCP task claim operation failed" in record.message]
+        assert len(claim_logs) == 1
+        assert "poll claim" in claim_logs[0].message
+        assert "task_id=batch" in claim_logs[0].message
+    finally:
+        await service.stop()
+
+
+@pytest.mark.asyncio
+async def test_same_tick_outer_claim_cancellation_wins_and_preserves_args():
+    caller = None
+
+    async def claim():
+        assert caller is not None
+        caller.cancel("same tick claim cancellation")
+        raise asyncio.CancelledError("claim cancelled itself")
+
+    service = McpTaskService(
+        repository=SimpleNamespace(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    caller = asyncio.create_task(
+        service._claim_with_cancellation_release(
+            claim(),
+            action="poll claim",
+            release=AsyncMock(),
+        )
+    )
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await caller
+
+    assert caught.value.args == ("same tick claim cancellation",)
+    assert not service._compensation_tasks

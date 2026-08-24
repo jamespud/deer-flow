@@ -157,6 +157,15 @@ class McpTaskService:
             exc_info=(type(error), error, error.__traceback__),
         )
 
+    @staticmethod
+    def _log_claim_error(error: BaseException, *, action: str) -> None:
+        logger.error(
+            "MCP task claim operation failed (%s, task_id=batch): %s",
+            action,
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
     def _track_batch_release_task(
         self,
         state: _BatchRecordState,
@@ -923,6 +932,13 @@ class McpTaskService:
         try:
             return await asyncio.shield(claim_task)
         except asyncio.CancelledError:
+            caller_cancelling = asyncio.current_task().cancelling()
+            claim_cancelled = _task_has_cancelled_terminal_state(claim_task)
+            if claim_cancelled and not caller_cancelling:
+                error = _consume_task_error(claim_task)
+                if error is not None:
+                    self._log_claim_error(error, action=action)
+                return []
             handoff = asyncio.create_task(
                 self._finish_cancelled_claim_handoff(
                     claim_task,
