@@ -2139,9 +2139,10 @@ async def test_notification_batch_fallback_release_survives_caller_cancellation(
 
 
 class NotificationPersistenceRepo:
-    def __init__(self, *, release_error: Exception | None = None):
+    def __init__(self, *, release_error: BaseException | None = None):
         self.claimed = False
         self.mark_started = asyncio.Event()
+        self.release_finished = asyncio.Event()
         self.release_calls = []
         self.release_error = release_error
 
@@ -2169,6 +2170,14 @@ class NotificationPersistenceRepo:
     async def release_notification_claim(self, task_id, **kwargs):
         self.release_calls.append((task_id, kwargs))
         if self.release_error is not None:
+            self.release_finished.set()
+            raise self.release_error
+        return True
+
+    async def release_notification_lease(self, task_id, **kwargs):
+        self.release_calls.append((task_id, kwargs))
+        if self.release_error is not None:
+            self.release_finished.set()
             raise self.release_error
         return True
 
@@ -2217,6 +2226,89 @@ async def test_notification_cancellation_preserves_cancelled_error_when_release_
 
     assert repo.release_calls
     assert "notification release unavailable" in caplog.text
+
+
+class NotificationFailureReleaseRepo(NotificationPersistenceRepo):
+    async def claim_notification_work(self, **_kwargs):
+        if self.claimed:
+            return []
+        self.claimed = True
+        return [
+            {
+                **_claimed_row(),
+                "notification_status": "dispatched",
+                "notification_run_id": "notify-run-1",
+                "dispatch_version": 2,
+            }
+        ]
+
+
+@pytest.mark.asyncio
+async def test_notification_failure_release_self_cancellation_does_not_kill_poller(caplog):
+    repo = NotificationFailureReleaseRepo(release_error=asyncio.CancelledError("notification release cancelled itself"))
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(return_value={"run_id": "notify-run-1"}),
+        get_run=AsyncMock(side_effect=RuntimeError("run store unavailable")),
+    )
+
+    try:
+        with caplog.at_level(logging.ERROR):
+            await service.start()
+            await repo.release_finished.wait()
+            async with asyncio.timeout(1):
+                while not any("MCP task batch release failed" in record.message for record in caplog.records):
+                    await asyncio.sleep(0)
+
+        assert service._task is not None
+        assert not service._task.done()
+        assert [task_id for task_id, _kwargs in repo.release_calls] == ["task-1"]
+        release_logs = [record for record in caplog.records if "MCP task batch release failed" in record.message]
+        assert len(release_logs) == 1
+        assert "release notification failure" in release_logs[0].message
+        assert "task_id=task-1" in release_logs[0].message
+    finally:
+        await service.stop()
+
+
+class SameTickNotificationFailureReleaseRepo(NotificationFailureReleaseRepo):
+    def __init__(self):
+        super().__init__(release_error=asyncio.CancelledError("notification release cancelled itself"))
+        self.caller_task = None
+
+    async def release_notification_lease(self, task_id, **kwargs):
+        self.release_calls.append((task_id, kwargs))
+        assert self.caller_task is not None
+        self.caller_task.cancel("same tick notification cancellation")
+        self.release_finished.set()
+        raise asyncio.CancelledError("notification release cancelled itself")
+
+
+@pytest.mark.asyncio
+async def test_notification_failure_release_same_tick_outer_cancellation_wins(caplog):
+    repo = SameTickNotificationFailureReleaseRepo()
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(return_value={"run_id": "notify-run-1"}),
+        get_run=AsyncMock(side_effect=RuntimeError("run store unavailable")),
+    )
+    caller = asyncio.create_task(service._run_notifications(now=datetime.now(UTC)))
+    repo.caller_task = caller
+
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError) as caught:
+        await caller
+
+    assert caught.value.args == ("same tick notification cancellation",)
+    assert repo.release_finished.is_set()
+    assert [task_id for task_id, _kwargs in repo.release_calls] == ["task-1"]
 
 
 @pytest.mark.asyncio

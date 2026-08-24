@@ -71,6 +71,14 @@ def _consume_task_error(task: asyncio.Future[Any]) -> BaseException | None:
         return exc
 
 
+def _task_has_cancelled_terminal_state(task: asyncio.Future[Any]) -> bool:
+    if not task.done():
+        return False
+    if task.cancelled():
+        return True
+    return isinstance(_consume_task_error(task), asyncio.CancelledError)
+
+
 class McpTaskService:
     """Persist and poll long-running MCP tasks outside the Agent loop."""
 
@@ -133,10 +141,18 @@ class McpTaskService:
         error = _consume_task_error(task)
         if error is None:
             return
+        self._log_batch_release_error(
+            error,
+            action=action,
+            task_id=state.record.get("id"),
+        )
+
+    @staticmethod
+    def _log_batch_release_error(error: BaseException, *, action: str, task_id: Any) -> None:
         logger.error(
             "MCP task batch release failed (%s, task_id=%s): %s",
             action,
-            state.record.get("id"),
+            task_id,
             error,
             exc_info=(type(error), error, error.__traceback__),
         )
@@ -197,7 +213,7 @@ class McpTaskService:
         except asyncio.CancelledError:
             caller_cancelling = asyncio.current_task().cancelling()
             self._observe_batch_release_task(state, task, ordinary=True, action=action)
-            release_cancelled = state.ordinary_release_terminal or (task.done() and task.cancelled())
+            release_cancelled = state.ordinary_release_terminal or _task_has_cancelled_terminal_state(task)
             if release_cancelled and not caller_cancelling:
                 return
             raise
@@ -1012,6 +1028,17 @@ class McpTaskService:
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
+            caller_cancelling = asyncio.current_task().cancelling()
+            release_cancelled = _task_has_cancelled_terminal_state(task)
+            if release_cancelled and not caller_cancelling:
+                error = _consume_task_error(task)
+                if error is not None:
+                    self._log_batch_release_error(
+                        error,
+                        action="release notification failure",
+                        task_id=record["id"],
+                    )
+                return
             await self._drain_cancellation_task(
                 task,
                 action="release notification failure",
