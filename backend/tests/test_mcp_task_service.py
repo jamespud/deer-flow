@@ -2010,6 +2010,36 @@ async def test_poll_cancellation_preserves_cancelled_error_when_release_fails(ca
     assert "poll release unavailable" in caplog.text
 
 
+async def _wait_for_compensation_tasks_to_clear(service: McpTaskService) -> None:
+    async with asyncio.timeout(1):
+        while service._compensation_tasks:
+            await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_compensation_registration_logs_failure_once(caplog):
+    service = McpTaskService(
+        repository=SimpleNamespace(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    compensation = asyncio.get_running_loop().create_future()
+
+    with caplog.at_level(logging.ERROR):
+        service._track_compensation_task(compensation, action="release poll claim", task_id="task-1")
+        service._track_compensation_task(compensation, action="release poll claim", task_id="task-1")
+        assert service._compensation_tasks == {compensation}
+
+        compensation.set_exception(RuntimeError("release remained unavailable"))
+        await _wait_for_compensation_tasks_to_clear(service)
+
+    failures = [record for record in caplog.records if "MCP task cancellation operation failed" in record.getMessage()]
+    assert len(failures) == 1
+    assert "release remained unavailable" in failures[0].getMessage()
+
+
 @pytest.mark.asyncio
 async def test_hung_cancellation_compensation_transfers_to_background(monkeypatch):
     monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
@@ -2046,8 +2076,7 @@ async def test_hung_cancellation_compensation_transfers_to_background(monkeypatc
     assert len(service._compensation_tasks) == 1
 
     release_gate.set()
-    await asyncio.gather(*service._compensation_tasks)
-    await asyncio.sleep(0)
+    await _wait_for_compensation_tasks_to_clear(service)
 
     assert not service._compensation_tasks
 
@@ -2089,8 +2118,9 @@ async def test_background_compensation_failure_is_consumed(monkeypatch, caplog):
 
     with caplog.at_level(logging.ERROR):
         release_gate.set()
-        await asyncio.gather(*service._compensation_tasks, return_exceptions=True)
-        await asyncio.sleep(0)
+        await _wait_for_compensation_tasks_to_clear(service)
 
-    assert "release remained unavailable" in caplog.text
+    failures = [record for record in caplog.records if "MCP task cancellation operation failed" in record.getMessage()]
+    assert len(failures) == 1
+    assert "release remained unavailable" in failures[0].getMessage()
     assert not service._compensation_tasks

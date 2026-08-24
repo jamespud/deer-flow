@@ -73,7 +73,7 @@ async def _drain_cancellation_operation(
     return False, None
 
 
-def _consume_task_error(task: asyncio.Task[Any]) -> BaseException | None:
+def _consume_task_error(task: asyncio.Future[Any]) -> BaseException | None:
     try:
         return task.exception()
     except asyncio.CancelledError as exc:
@@ -113,7 +113,7 @@ class McpTaskService:
         self._get_run = get_run
         self._lease_owner = f"{socket.gethostname()}:{uuid.uuid4().hex}"
         self._task: asyncio.Task[None] | None = None
-        self._compensation_tasks: set[asyncio.Task[Any]] = set()
+        self._compensation_tasks: set[asyncio.Future[Any]] = set()
         self._stop = asyncio.Event()
 
     @property
@@ -212,7 +212,7 @@ class McpTaskService:
         )
         self._compensation_tasks.add(compensation)
 
-        def finalize(task: asyncio.Task[Any]) -> None:
+        def finalize(task: asyncio.Future[Any]) -> None:
             self._compensation_tasks.discard(task)
             error = _consume_task_error(task)
             if error is None:
@@ -239,10 +239,12 @@ class McpTaskService:
                 task_reference.remote_task_id,
             )
 
-    def _track_compensation_task(self, task: asyncio.Task[Any], *, action: str, task_id: str) -> None:
+    def _track_compensation_task(self, task: asyncio.Future[Any], *, action: str, task_id: str) -> None:
+        if task in self._compensation_tasks:
+            return
         self._compensation_tasks.add(task)
 
-        def finalize(completed: asyncio.Task[Any]) -> None:
+        def finalize(completed: asyncio.Future[Any]) -> None:
             self._compensation_tasks.discard(completed)
             error = _consume_task_error(completed)
             if error is None:
@@ -259,7 +261,7 @@ class McpTaskService:
 
     async def _drain_cancellation_task(
         self,
-        task: asyncio.Task[Any],
+        task: asyncio.Future[Any],
         *,
         action: str,
         task_id: str,
