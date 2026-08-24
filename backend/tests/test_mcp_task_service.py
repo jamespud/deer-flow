@@ -1420,6 +1420,194 @@ async def test_stop_cancels_a_hung_driver_poll():
 
 
 @pytest.mark.asyncio
+async def test_stop_callers_share_deadline_and_log_one_timeout(monkeypatch, caplog):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.05)
+    clock = [0.0]
+    wait_timeouts = []
+    wait_started = [asyncio.Event(), asyncio.Event()]
+    release_wait = asyncio.Event()
+
+    async def fake_wait(_tasks, *, timeout):
+        wait_timeouts.append(timeout)
+        wait_started[len(wait_timeouts) - 1].set()
+        if len(wait_timeouts) == 1:
+            # The second caller arrives 40ms into the first caller's budget.
+            clock[0] = 0.04
+        await release_wait.wait()
+        return set(), set()
+
+    monkeypatch.setattr(service_module.asyncio, "wait", fake_wait)
+    monkeypatch.setattr(
+        service_module.asyncio,
+        "get_running_loop",
+        lambda: SimpleNamespace(time=lambda: clock[0]),
+    )
+
+    poller_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish = asyncio.Event()
+    cancel_count = 0
+
+    async def stubborn_poller():
+        nonlocal cancel_count
+        poller_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancel_count += 1
+            cleanup_started.set()
+            await finish.wait()
+
+    service = McpTaskService(
+        repository=FakeRepository(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=60,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    monkeypatch.setattr(service, "_run_loop", stubborn_poller)
+
+    await service.start()
+    await poller_started.wait()
+    poller = service._task
+    assert poller is not None
+    first_stop = second_stop = None
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            first_stop = asyncio.create_task(service.stop())
+            await wait_started[0].wait()
+            await cleanup_started.wait()
+
+            second_stop = asyncio.create_task(service.stop())
+            await wait_started[1].wait()
+
+            assert wait_timeouts == pytest.approx([0.05, 0.01])
+            release_wait.set()
+            await asyncio.gather(first_stop, second_stop)
+
+        assert cancel_count == 1
+        assert sum("Timed out after" in record.getMessage() for record in caplog.records) == 1
+    finally:
+        release_wait.set()
+        if first_stop is not None and not first_stop.done():
+            await first_stop
+        if second_stop is not None and not second_stop.done():
+            await second_stop
+        finish.set()
+        await poller
+
+
+@pytest.mark.asyncio
+async def test_poller_done_clears_stop_state_and_ignores_stale_callback(monkeypatch, caplog):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.05)
+    clock = [0.0]
+    wait_timeouts = []
+    wait_started = [asyncio.Event(), asyncio.Event()]
+    release_wait = [asyncio.Event(), asyncio.Event()]
+
+    async def fake_wait(_tasks, *, timeout):
+        index = len(wait_timeouts)
+        wait_timeouts.append(timeout)
+        wait_started[index].set()
+        await release_wait[index].wait()
+        return set(), set()
+
+    monkeypatch.setattr(service_module.asyncio, "wait", fake_wait)
+    monkeypatch.setattr(
+        service_module.asyncio,
+        "get_running_loop",
+        lambda: SimpleNamespace(time=lambda: clock[0]),
+    )
+
+    first_started = asyncio.Event()
+    first_finish = asyncio.Event()
+    second_started = asyncio.Event()
+    second_finish = asyncio.Event()
+
+    async def first_poller():
+        first_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await first_finish.wait()
+
+    async def second_poller():
+        second_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await second_finish.wait()
+
+    pollers = iter((first_poller, second_poller))
+
+    async def run_loop():
+        await next(pollers)()
+
+    service = McpTaskService(
+        repository=FakeRepository(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=60,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    monkeypatch.setattr(service, "_run_loop", run_loop)
+
+    await service.start()
+    await first_started.wait()
+    first_task = service._task
+    assert first_task is not None
+
+    with caplog.at_level(logging.WARNING):
+        first_stop = asyncio.create_task(service.stop())
+        await wait_started[0].wait()
+        release_wait[0].set()
+        await first_stop
+
+        assert service._stop_deadline == pytest.approx(0.05)
+        assert service._stop_timeout_logged is True
+
+        first_finish.set()
+        await first_task
+        await asyncio.sleep(0)
+        assert service._task is None
+        assert service._stopping_task is None
+        assert service._stop_deadline is None
+        assert service._stop_timeout_logged is False
+
+        clock[0] = 10.0
+        await service.start()
+        await second_started.wait()
+        second_task = service._task
+        assert second_task is not None
+
+        second_stop = asyncio.create_task(service.stop())
+        await wait_started[1].wait()
+        assert wait_timeouts == pytest.approx([0.05, 0.05])
+
+        # A callback from the completed poller must not clear the new episode.
+        service._poller_done(first_task)
+        assert service._task is second_task
+        assert service._stopping_task is second_task
+        assert service._stop_deadline == pytest.approx(10.05)
+        assert service._stop_timeout_logged is False
+
+        release_wait[1].set()
+        await second_stop
+        assert service._stop_timeout_logged is True
+
+    second_finish.set()
+    await second_task
+    await asyncio.sleep(0)
+
+    assert service._task is None
+    assert service._stopping_task is None
+    assert service._stop_deadline is None
+    assert service._stop_timeout_logged is False
+    assert sum("Timed out after" in record.getMessage() for record in caplog.records) == 2
+
+
+@pytest.mark.asyncio
 async def test_stop_returns_with_timed_out_poller_and_start_does_not_overlap(monkeypatch):
     monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
     poller_started = asyncio.Event()

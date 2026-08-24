@@ -83,6 +83,9 @@ class McpTaskService:
         self._get_run = get_run
         self._lease_owner = f"{socket.gethostname()}:{uuid.uuid4().hex}"
         self._task: asyncio.Task[None] | None = None
+        self._stopping_task: asyncio.Task[None] | None = None
+        self._stop_deadline: float | None = None
+        self._stop_timeout_logged = False
         self._compensation_tasks: set[asyncio.Future[Any]] = set()
         self._stop = asyncio.Event()
 
@@ -881,6 +884,9 @@ class McpTaskService:
         if self._task is not None:
             return
         self._stop.clear()
+        self._stopping_task = None
+        self._stop_deadline = None
+        self._stop_timeout_logged = False
         task = asyncio.create_task(self._run_loop(), name="deerflow-mcp-task-poller")
         self._task = task
         task.add_done_callback(self._poller_done)
@@ -888,6 +894,9 @@ class McpTaskService:
     def _poller_done(self, task: asyncio.Task[None]) -> None:
         if self._task is task:
             self._task = None
+            self._stopping_task = None
+            self._stop_deadline = None
+            self._stop_timeout_logged = False
         error = _consume_task_error(task)
         if error is None or isinstance(error, asyncio.CancelledError):
             return
@@ -897,16 +906,28 @@ class McpTaskService:
             exc_info=(type(error), error, error.__traceback__),
         )
 
+    def _log_stop_timeout(self, task: asyncio.Task[None]) -> None:
+        if self._stopping_task is not task or self._stop_timeout_logged:
+            return
+        self._stop_timeout_logged = True
+        logger.warning(
+            "Timed out after %.1f seconds waiting for MCP task poller cleanup; cleanup continues in the background",
+            _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+        )
+
     async def stop(self) -> None:
         task = self._task
         if task is None:
             return
-        was_stopping = self._stop.is_set()
-        self._stop.set()
-        if not was_stopping:
-            task.cancel()
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+        if self._stopping_task is not task:
+            self._stopping_task = task
+            self._stop_deadline = loop.time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+            self._stop_timeout_logged = False
+            task.cancel()
+        self._stop.set()
+        deadline = self._stop_deadline
+        assert deadline is not None
         try:
             done, _ = await asyncio.wait(
                 {task},
@@ -914,16 +935,10 @@ class McpTaskService:
             )
         except asyncio.CancelledError:
             if not await wait_for_task_until(task, deadline=deadline):
-                logger.warning(
-                    "Timed out after %.1f seconds waiting for MCP task poller cleanup; cleanup continues in the background",
-                    _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
-                )
+                self._log_stop_timeout(task)
             raise
         if task not in done:
-            logger.warning(
-                "Timed out after %.1f seconds waiting for MCP task poller cleanup; cleanup continues in the background",
-                _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
-            )
+            self._log_stop_timeout(task)
 
     async def _run_loop(self) -> None:
         while not self._stop.is_set():
