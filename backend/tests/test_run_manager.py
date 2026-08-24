@@ -511,6 +511,231 @@ async def test_shutdown_keeps_dynamic_cleanup_supervised_after_deadline(caplog: 
 
 
 @pytest.mark.anyio
+async def test_shutdown_waits_for_delayed_run_completion_cleanup_registration():
+    manager = RunManager()
+    cleanup_finished = asyncio.Event()
+    cleanup_registered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    async def register_cleanup() -> None:
+        await asyncio.sleep(0)
+        cleanup = asyncio.create_task(cleanup_finished.wait())
+        manager._track_cancellation_cleanup(cleanup, action="delayed cleanup", run_id="run-1")
+        cleanup_registered.set()
+
+    async def run() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+
+    def schedule_register() -> None:
+        asyncio.create_task(register_cleanup())
+
+    def second_barrier() -> None:
+        loop.call_soon(schedule_register)
+
+    def first_barrier() -> None:
+        loop.call_soon(second_barrier)
+
+    def after_run(_completed: asyncio.Future[None]) -> None:
+        loop.call_soon(first_barrier)
+
+    record.task.add_done_callback(after_run)
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.05))
+    await asyncio.wait_for(cleanup_registered.wait(), timeout=0.2)
+    assert shutdown_task.done() is False
+    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    cleanup_finished.set()
+    await shutdown_task
+    await asyncio.sleep(0)
+    assert cleanup.done() is True
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_keeps_delayed_stalled_cleanup_supervised_until_deadline(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    cleanup_finished = asyncio.Event()
+    cleanup_registered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    async def register_cleanup() -> None:
+        await asyncio.sleep(0)
+        cleanup = asyncio.create_task(cleanup_finished.wait())
+        manager._track_cancellation_cleanup(cleanup, action="delayed stalled cleanup", run_id="run-1")
+        cleanup_registered.set()
+
+    async def run() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+
+    def schedule_register() -> None:
+        asyncio.create_task(register_cleanup())
+
+    def second_barrier() -> None:
+        loop.call_soon(schedule_register)
+
+    def first_barrier() -> None:
+        loop.call_soon(second_barrier)
+
+    def after_run(_completed: asyncio.Future[None]) -> None:
+        loop.call_soon(first_barrier)
+
+    record.task.add_done_callback(after_run)
+    with caplog.at_level(logging.WARNING):
+        shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.05))
+        await asyncio.wait_for(cleanup_registered.wait(), timeout=0.2)
+        assert shutdown_task.done() is False
+        await shutdown_task
+
+    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    assert cleanup.done() is False
+    assert any("cancellation cleanup task" in message for message in caplog.messages)
+    cleanup_finished.set()
+    await cleanup
+    await asyncio.sleep(0)
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_stop_heartbeat_stubborn_task_keeps_one_background_owner_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    manager = RunManager(
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    heartbeat_started = asyncio.Event()
+    heartbeat_cancelled = asyncio.Event()
+    finish_heartbeat = asyncio.Event()
+    cancel_calls = 0
+
+    async def stubborn_heartbeat() -> None:
+        nonlocal cancel_calls
+        heartbeat_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancel_calls += 1
+            heartbeat_cancelled.set()
+            await finish_heartbeat.wait()
+            raise RuntimeError("late heartbeat failure")
+
+    monkeypatch.setattr(manager, "_heartbeat_loop", stubborn_heartbeat)
+    await manager.start_heartbeat()
+    task = manager._heartbeat_task
+    assert task is not None
+    await heartbeat_started.wait()
+    started = asyncio.get_running_loop().time()
+
+    with caplog.at_level(logging.WARNING):
+        await manager.stop_heartbeat(timeout=0.01)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 0.2
+    await asyncio.wait_for(heartbeat_cancelled.wait(), timeout=0.2)
+    assert heartbeat_cancelled.is_set()
+    assert cancel_calls == 1
+    assert manager._heartbeat_task is task
+    assert "background" in caplog.text
+
+    started = asyncio.get_running_loop().time()
+    await manager.stop_heartbeat(timeout=0.01)
+    assert asyncio.get_running_loop().time() - started < 0.05
+    assert cancel_calls == 1
+
+    finish_heartbeat.set()
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert manager._heartbeat_task is None
+    assert "late heartbeat failure" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_orphan_recovery_stubborn_task_keeps_one_background_owner_after_deadline(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    recovery_started = asyncio.Event()
+    recovery_cancelled = asyncio.Event()
+    finish_recovery = asyncio.Event()
+    cancel_calls = 0
+
+    async def stubborn_recovery() -> None:
+        nonlocal cancel_calls
+        recovery_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancel_calls += 1
+            recovery_cancelled.set()
+            await finish_recovery.wait()
+            raise RuntimeError("late orphan recovery failure")
+
+    task = asyncio.create_task(stubborn_recovery())
+    manager._orphan_recovery_task = task
+    task.add_done_callback(manager._orphan_reconciliation_done)
+    await recovery_started.wait()
+    started = asyncio.get_running_loop().time()
+
+    with caplog.at_level(logging.WARNING):
+        await manager._drain_orphan_recovery_task(timeout=0.01)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 0.2
+    await asyncio.wait_for(recovery_cancelled.wait(), timeout=0.2)
+    assert recovery_cancelled.is_set()
+    assert cancel_calls == 1
+    assert manager._orphan_recovery_task is task
+    assert "background" in caplog.text
+
+    started = asyncio.get_running_loop().time()
+    await manager._drain_orphan_recovery_task(timeout=0.01)
+    assert asyncio.get_running_loop().time() - started < 0.05
+    assert cancel_calls == 1
+
+    finish_recovery.set()
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert manager._orphan_recovery_task is None
+    assert "late orphan recovery failure" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_stop_heartbeat_consumes_completed_failure_once(caplog: pytest.LogCaptureFixture):
+    manager = RunManager(
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+
+    async def failed_heartbeat() -> None:
+        raise RuntimeError("heartbeat failure")
+
+    manager._heartbeat_loop = failed_heartbeat
+    await manager.start_heartbeat()
+    await asyncio.sleep(0)
+
+    with caplog.at_level(logging.WARNING):
+        await manager.stop_heartbeat(timeout=0)
+        await asyncio.sleep(0)
+
+    assert caplog.messages.count("Run lease heartbeat failed; its task has stopped") == 1
+    assert manager._heartbeat_task is None
+
+
+@pytest.mark.anyio
 async def test_reservation_delete_failure_preserves_body_error_and_clears_local_record(caplog):
     store = FailingDeleteRunStore()
     manager = RunManager(

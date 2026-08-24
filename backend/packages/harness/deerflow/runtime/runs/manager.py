@@ -252,7 +252,10 @@ class RunManager:
         self._heartbeat_task: asyncio.Task | None = None
         self._heartbeat_stop: asyncio.Event | None = None
         self._orphan_recovery_task: asyncio.Task[None] | None = None
+        self._heartbeat_cancel_requested = False
+        self._orphan_recovery_cancel_requested = False
         self._cancellation_cleanup_tasks: set[asyncio.Future[None]] = set()
+        self._cancellation_cleanup_generation = 0
 
     def _track_cancellation_cleanup(
         self,
@@ -265,9 +268,12 @@ class RunManager:
         if task in self._cancellation_cleanup_tasks:
             return
         self._cancellation_cleanup_tasks.add(task)
+        self._cancellation_cleanup_generation += 1
 
         def finalize(completed: asyncio.Future[None]) -> None:
-            self._cancellation_cleanup_tasks.discard(completed)
+            if completed in self._cancellation_cleanup_tasks:
+                self._cancellation_cleanup_tasks.discard(completed)
+                self._cancellation_cleanup_generation += 1
             try:
                 error = completed.exception()
             except asyncio.CancelledError as exc:
@@ -283,6 +289,38 @@ class RunManager:
             )
 
         task.add_done_callback(finalize)
+
+    @staticmethod
+    def _loop_has_pending_callbacks(loop: asyncio.AbstractEventLoop) -> bool:
+        """Return whether the loop has callbacks ready for another turn.
+
+        The private queues are used only for shutdown quiescence: a done-task
+        callback can enqueue another callback after the manager's own await has
+        resumed. Checking the queues lets us drain that finite callback chain
+        without guessing a fixed number of ``sleep(0)`` turns.
+        """
+        ready = getattr(loop, "_ready", ())
+        if any(not handle.cancelled() for handle in ready):
+            return True
+        now = loop.time()
+        scheduled = getattr(loop, "_scheduled", ())
+        return any(not handle.cancelled() and getattr(handle, "_when", now + 1) <= now for handle in scheduled)
+
+    async def _await_cleanup_registration_quiescence(self, *, deadline: float) -> bool:
+        """Wait for a stable event-loop turn before ending shutdown ownership."""
+        loop = asyncio.get_running_loop()
+        generation = self._cancellation_cleanup_generation
+        while True:
+            barrier = loop.create_future()
+            loop.call_soon(barrier.set_result, None)
+            if not await wait_for_task_until(barrier, deadline=deadline):
+                return False
+            if self._cancellation_cleanup_generation != generation:
+                generation = self._cancellation_cleanup_generation
+                continue
+            if self._loop_has_pending_callbacks(loop):
+                continue
+            return True
 
     async def _drain_cancellation_cleanup(
         self,
@@ -2042,31 +2080,71 @@ class RunManager:
         """
         if not self.heartbeat_enabled:
             return
-        if self._heartbeat_task is not None and not self._heartbeat_task.done():
-            return
+        if self._heartbeat_task is not None:
+            if not self._heartbeat_task.done():
+                return
+            self._clear_heartbeat_owner(self._heartbeat_task)
         self._heartbeat_stop = asyncio.Event()
+        self._heartbeat_cancel_requested = False
         task = asyncio.create_task(self._heartbeat_loop())
         task.set_name("deerflow-run-lease-heartbeat")
         self._heartbeat_task = task
+        task.add_done_callback(self._heartbeat_done)
         logger.info("Run lease heartbeat started for worker %s", self._worker_id)
 
+    def _clear_heartbeat_owner(self, task: asyncio.Task[None]) -> None:
+        if self._heartbeat_task is task:
+            self._heartbeat_task = None
+            self._heartbeat_stop = None
+            self._heartbeat_cancel_requested = False
+
+    def _heartbeat_done(self, task: asyncio.Task[None]) -> None:
+        """Release the heartbeat owner and consume its terminal result."""
+        self._clear_heartbeat_owner(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.warning("Run lease heartbeat failed; its task has stopped", exc_info=True)
+
     async def stop_heartbeat(self, *, timeout: float = 5.0) -> None:
-        """Stop the background heartbeat task within ``timeout`` seconds."""
+        """Stop the heartbeat within ``timeout`` and supervise late completion."""
         if self._heartbeat_stop is not None:
             self._heartbeat_stop.set()
-        if self._heartbeat_task is not None and not self._heartbeat_task.done():
-            _, pending = await asyncio.wait(
-                (self._heartbeat_task,),
-                timeout=max(0.0, timeout),
+        task = self._heartbeat_task
+        if task is None:
+            self._heartbeat_stop = None
+            logger.info("Run lease heartbeat stopped for worker %s", self._worker_id)
+            return
+        if task.done():
+            self._clear_heartbeat_owner(task)
+            logger.info("Run lease heartbeat stopped for worker %s", self._worker_id)
+            return
+        if self._heartbeat_cancel_requested or task.cancelling():
+            logger.warning(
+                "Run lease heartbeat cancellation is already pending; it continues in the background (task=%s)",
+                task.get_name(),
             )
-            if pending:
-                self._heartbeat_task.cancel()
-                try:
-                    await self._heartbeat_task
-                except asyncio.CancelledError:
-                    pass
-        self._heartbeat_task = None
-        self._heartbeat_stop = None
+            return
+
+        _, pending = await asyncio.wait(
+            (task,),
+            timeout=max(0.0, timeout),
+        )
+        if pending:
+            task.cancel()
+            self._heartbeat_cancel_requested = True
+            logger.warning(
+                "Run lease heartbeat did not stop within %.1fs; cancellation continues in the background (task=%s)",
+                timeout,
+                task.get_name(),
+            )
+            await asyncio.sleep(0)
+            if task.done():
+                await asyncio.sleep(0)
+        else:
+            self._clear_heartbeat_owner(task)
         logger.info("Run lease heartbeat stopped for worker %s", self._worker_id)
 
     async def _heartbeat_loop(self) -> None:
@@ -2261,12 +2339,14 @@ class RunManager:
         task = asyncio.create_task(self._reconcile_orphans_periodic())
         task.set_name("deerflow-periodic-orphan-recovery")
         self._orphan_recovery_task = task
+        self._orphan_recovery_cancel_requested = False
         task.add_done_callback(self._orphan_reconciliation_done)
 
     def _orphan_reconciliation_done(self, task: asyncio.Task[None]) -> None:
         """Clear and inspect the supervised single-flight recovery task."""
         if self._orphan_recovery_task is task:
             self._orphan_recovery_task = None
+            self._orphan_recovery_cancel_requested = False
         if task.cancelled():
             return
         try:
@@ -2275,18 +2355,29 @@ class RunManager:
             logger.warning("Periodic orphan reconciliation failed", exc_info=True)
 
     async def _drain_orphan_recovery_task(self, *, timeout: float) -> None:
-        """Boundedly await the supervised recovery pass during shutdown."""
+        """Observe orphan recovery without extending the caller's deadline."""
         task = self._orphan_recovery_task
         if task is None or task.done():
             return
-        _, pending = await asyncio.wait((task,), timeout=max(0.0, timeout))
-        if pending:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if self._orphan_recovery_cancel_requested or task.cancelling():
             logger.warning(
-                "Orphan recovery drain exceeded %.1fs on shutdown; cancelled the active pass",
-                timeout,
+                "Orphan recovery cancellation is already pending; it continues in the background (task=%s)",
+                task.get_name(),
             )
+            return
+        _, pending = await asyncio.wait((task,), timeout=max(0.0, timeout))
+        if not pending:
+            return
+        task.cancel()
+        self._orphan_recovery_cancel_requested = True
+        logger.warning(
+            "Orphan recovery drain exceeded %.1fs; cancellation continues in the background (task=%s)",
+            timeout,
+            task.get_name(),
+        )
+        await asyncio.sleep(0)
+        if task.done():
+            await asyncio.sleep(0)
 
     async def shutdown(self, *, timeout: float = 5.0) -> None:
         """Cancel and bounded-await all in-flight runs on process shutdown.
@@ -2343,11 +2434,14 @@ class RunManager:
             active_cleanup_tasks = {task for task in self._cancellation_cleanup_tasks if not task.done()}
             owned_tasks = active_run_tasks | active_cleanup_tasks
             if not owned_tasks:
-                await asyncio.sleep(0)
-                active_cleanup_tasks = {task for task in self._cancellation_cleanup_tasks if not task.done()}
-                if not active_cleanup_tasks:
+                if not await self._await_cleanup_registration_quiescence(deadline=deadline):
+                    pending_run_tasks = active_run_tasks
                     break
-                owned_tasks = active_cleanup_tasks
+                active_run_tasks = {task for task in run_tasks if task is not None and not task.done()}
+                active_cleanup_tasks = {task for task in self._cancellation_cleanup_tasks if not task.done()}
+                if not active_run_tasks and not active_cleanup_tasks:
+                    break
+                continue
 
             remaining = deadline - loop.time()
             if remaining <= 0:
