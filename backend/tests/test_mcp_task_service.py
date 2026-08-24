@@ -2017,6 +2017,96 @@ async def _wait_for_compensation_tasks_to_clear(service: McpTaskService) -> None
 
 
 @pytest.mark.asyncio
+async def test_cancelled_hung_claim_returns_then_releases_delayed_result(monkeypatch):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    claim_started = asyncio.Event()
+    claim_gate = asyncio.Event()
+    release_calls = []
+
+    async def claim():
+        claim_started.set()
+        await claim_gate.wait()
+        return [_claimed_row()]
+
+    async def release(record):
+        release_calls.append(record["id"])
+
+    service = McpTaskService(
+        repository=SimpleNamespace(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    caller = asyncio.create_task(
+        service._claim_with_cancellation_release(
+            claim(),
+            action="probe claim",
+            release=release,
+        )
+    )
+    await claim_started.wait()
+    caller.cancel()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(caller), timeout=0.2)
+
+        assert release_calls == []
+        assert len(service._compensation_tasks) == 1
+
+        claim_gate.set()
+        await _wait_for_compensation_tasks_to_clear(service)
+
+        assert release_calls == ["task-1"]
+        assert not service._compensation_tasks
+    finally:
+        claim_gate.set()
+        if not caller.done():
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(caller, timeout=0.2)
+        await _wait_for_compensation_tasks_to_clear(service)
+
+
+@pytest.mark.asyncio
+async def test_batch_release_starts_sibling_when_first_release_hangs():
+    first_release_gate = asyncio.Event()
+    second_release_completed = asyncio.Event()
+    release_calls = []
+
+    async def release(record):
+        release_calls.append(record["id"])
+        if record["id"] == "first":
+            await first_release_gate.wait()
+        else:
+            second_release_completed.set()
+
+    service = McpTaskService(
+        repository=SimpleNamespace(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    batch = asyncio.create_task(
+        service._release_claimed_records(
+            [
+                {**_claimed_row(), "id": "first"},
+                {**_claimed_row(), "id": "second"},
+            ],
+            release=release,
+        )
+    )
+
+    try:
+        await asyncio.wait_for(second_release_completed.wait(), timeout=0.2)
+        assert release_calls == ["first", "second"]
+    finally:
+        first_release_gate.set()
+        await asyncio.wait_for(batch, timeout=0.2)
+
+
+@pytest.mark.asyncio
 async def test_duplicate_compensation_registration_logs_failure_once(caplog):
     service = McpTaskService(
         repository=SimpleNamespace(),

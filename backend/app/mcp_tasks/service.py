@@ -43,36 +43,6 @@ def _bound_error(error: str | None) -> str | None:
     return error[:_MAX_PERSISTED_ERROR_CHARS]
 
 
-async def _drain_cancellation_operation(
-    operation: Awaitable[Any],
-    *,
-    action: str,
-    task_id: str,
-) -> tuple[bool, Any]:
-    """Drain one operation through repeated cancellation and capture its result."""
-    task = asyncio.ensure_future(operation)
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            continue
-        except Exception:
-            break
-    try:
-        return True, task.result()
-    except asyncio.CancelledError:
-        logger.error("MCP task cancellation operation was cancelled (%s, task_id=%s)", action, task_id)
-    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort; preserve original cancellation
-        logger.error(
-            "MCP task cancellation operation failed (%s, task_id=%s): %s",
-            action,
-            task_id,
-            exc,
-            exc_info=(type(exc), exc, exc.__traceback__),
-        )
-    return False, None
-
-
 def _consume_task_error(task: asyncio.Future[Any]) -> BaseException | None:
     try:
         return task.exception()
@@ -653,22 +623,45 @@ class McpTaskService:
         try:
             return await asyncio.shield(claim_task)
         except asyncio.CancelledError:
-            completed, records = await _drain_cancellation_operation(
-                claim_task,
-                action=f"drain {action}",
-                task_id="batch",
+            handoff = asyncio.create_task(
+                self._finish_cancelled_claim_handoff(
+                    claim_task,
+                    action=action,
+                    release=release,
+                ),
+                name=f"mcp-cancelled-{action.replace(' ', '-')}-handoff",
             )
-            if completed and records:
-                release_task = asyncio.create_task(
-                    self._release_claimed_records(records, release=release),
-                    name=f"mcp-release-{action.replace(' ', '-')}-batch",
-                )
-                await _drain_cancellation_operation(
-                    release_task,
-                    action=f"release {action} batch",
-                    task_id="batch",
-                )
+            loop = asyncio.get_running_loop()
+            await self._drain_cancellation_task(
+                handoff,
+                action=f"finish {action} handoff",
+                task_id="batch",
+                deadline=loop.time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+            )
             raise
+
+    async def _finish_cancelled_claim_handoff(
+        self,
+        claim_task: asyncio.Future[list[dict[str, Any]]],
+        *,
+        action: str,
+        release: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        try:
+            records = await claim_task
+        except asyncio.CancelledError:
+            logger.error("MCP task claim operation was cancelled (%s, task_id=batch)", action)
+            return
+        except Exception as exc:  # noqa: BLE001 - claim recovery is best-effort
+            logger.error(
+                "MCP task claim operation failed (%s, task_id=batch): %s",
+                action,
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            return
+        if records:
+            await self._release_claimed_records(records, release=release)
 
     async def _release_claimed_records(
         self,
@@ -676,7 +669,7 @@ class McpTaskService:
         *,
         release: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
-        for record in records:
+        async def release_one(record: dict[str, Any]) -> None:
             try:
                 await release(record)
             except asyncio.CancelledError:
@@ -686,6 +679,15 @@ class McpTaskService:
                     "Unexpected MCP task claim release failure (task_id=%s)",
                     record.get("id"),
                 )
+
+        release_tasks = [
+            asyncio.create_task(
+                release_one(record),
+                name=f"mcp-release-claimed-{record.get('id', 'unknown')}",
+            )
+            for record in records
+        ]
+        await asyncio.gather(*release_tasks, return_exceptions=True)
 
     async def _release_cancel_after_cancellation(self, record: dict[str, Any]) -> None:
         await self._drain_cancellation_compensation(
