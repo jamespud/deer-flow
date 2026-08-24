@@ -780,6 +780,74 @@ class TestBufferFlush:
             if detached:
                 await asyncio.gather(*detached, return_exceptions=True)
 
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("eventual_error", [False, True], ids=["threshold-late-success", "threshold-late-failure"])
+    async def test_threshold_detached_predecessor_blocks_foreground_flush_until_resolution(self, monkeypatch, eventual_error):
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+        class OrderedStore:
+            def __init__(self):
+                self.calls: list[list[str]] = []
+                self.first_started = asyncio.Event()
+                self.first_finish = asyncio.Event()
+
+            async def put_batch(self, batch):
+                self.calls.append([event["event_type"] for event in batch])
+                if len(self.calls) == 1:
+                    self.first_started.set()
+                    await self.first_finish.wait()
+                    if eventual_error:
+                        raise RuntimeError("threshold journal write failed late")
+                    return []
+                return []
+
+        store = OrderedStore()
+        journal = RunJournal("r1", "t1", store, flush_threshold=1)
+        journal._put(event_type="first", category="trace", content="first")
+        threshold_task = next(iter(journal._pending_flush_tasks))
+        foreground = None
+        try:
+            await store.first_started.wait()
+            assert threshold_task.done() is False
+
+            journal._flush_threshold = 100
+            journal._put(event_type="second", category="trace", content="second")
+            assert [event["event_type"] for event in journal._buffer] == ["second"]
+
+            foreground = asyncio.create_task(journal.flush())
+            await asyncio.sleep(0)
+            assert foreground.done() is False
+
+            threshold_task.cancel()
+            threshold_result = await asyncio.gather(threshold_task, return_exceptions=True)
+            assert isinstance(threshold_result[0], asyncio.CancelledError)
+            await asyncio.sleep(0)
+
+            done, _ = await asyncio.wait({foreground}, timeout=0.05)
+            assert foreground not in done
+            assert store.calls == [["first"]]
+            assert len(journal._detached_write_tasks) == 1
+
+            store.first_finish.set()
+            await asyncio.wait_for(foreground, timeout=0.2)
+            if eventual_error:
+                assert store.calls == [["first"], ["first", "second"]]
+            else:
+                assert store.calls == [["first"], ["second"]]
+            assert journal._buffer == []
+            assert journal._detached_write_tasks == {}
+            assert journal._pending_flush_tasks == set()
+        finally:
+            store.first_finish.set()
+            await asyncio.gather(threshold_task, return_exceptions=True)
+            if foreground is not None:
+                await asyncio.gather(foreground, return_exceptions=True)
+            detached = tuple(getattr(journal, "_detached_write_tasks", ()))
+            if detached:
+                await asyncio.gather(*detached, return_exceptions=True)
+
 
 class TestIdentifyCaller:
     def test_lead_agent_tag(self, journal_setup):

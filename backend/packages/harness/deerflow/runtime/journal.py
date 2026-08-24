@@ -778,6 +778,21 @@ class RunJournal(BaseCallbackHandler):
                 await wait_for_task_until(task, deadline=deadline)
             raise
 
+    async def _await_write_predecessors(self) -> None:
+        """Observe pending and detached writes until no predecessor can appear."""
+        while True:
+            has_detached_writes = bool(self._detached_write_tasks)
+            has_pending_flushes = bool(self._pending_flush_tasks)
+            if not has_detached_writes and not has_pending_flushes:
+                return
+            if has_detached_writes:
+                await self._await_detached_writes()
+            if has_pending_flushes:
+                await self._await_pending_flush_tasks()
+            # Let completion callbacks move a cancelled threshold write into
+            # the detached registry before checking the fixed point again.
+            await asyncio.sleep(0)
+
     async def _flush_async(self, batch: list[dict], *, detached: _DetachedFlush | None = None) -> None:
         if detached is not None:
             detached.started = True
@@ -994,8 +1009,7 @@ class RunJournal(BaseCallbackHandler):
 
     async def flush(self) -> None:
         """Force flush remaining buffer. Called in worker's finally block."""
-        await self._await_detached_writes()
-        await self._await_pending_flush_tasks()
+        await self._await_write_predecessors()
         while self._pending_progress_task is not None and not self._pending_progress_task.done():
             if self._pending_progress_delayed:
                 self._pending_progress_task.cancel()
