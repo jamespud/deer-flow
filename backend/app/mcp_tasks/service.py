@@ -735,6 +735,7 @@ class McpTaskService:
             await self._repository.apply_cancel_snapshot(
                 record["id"],
                 lease_owner=self._lease_owner,
+                lease_token=record["lease_token"],
                 status=snapshot.status.value,
                 result=snapshot.result,
                 result_preview=snapshot.result_preview,
@@ -754,6 +755,7 @@ class McpTaskService:
                 release=lambda: self._repository.release_cancel_claim(
                     record["id"],
                     lease_owner=self._lease_owner,
+                    lease_token=record["lease_token"],
                     next_cancel_at=failed_at + timedelta(seconds=retry_seconds),
                     error=retry_error,
                 ),
@@ -809,6 +811,7 @@ class McpTaskService:
             await self._repository.dead_letter_notification(
                 task_id,
                 lease_owner=self._lease_owner,
+                notification_lease_token=record["notification_lease_token"],
                 dispatch_version=dispatch_version,
                 error=_bound_error(f"Notification delivery stopped after {notification_attempts} failed attempts: {previous_error}"),
                 count_failure=False,
@@ -824,6 +827,7 @@ class McpTaskService:
                 await self._repository.finish_notification_run(
                     task_id,
                     lease_owner=self._lease_owner,
+                    notification_lease_token=record["notification_lease_token"],
                     dispatch_version=dispatch_version,
                     delivered=False,
                     next_notification_at=now + timedelta(seconds=self._notification_retry_seconds(record)),
@@ -834,6 +838,7 @@ class McpTaskService:
                 await self._repository.finish_notification_run(
                     task_id,
                     lease_owner=self._lease_owner,
+                    notification_lease_token=record["notification_lease_token"],
                     dispatch_version=dispatch_version,
                     delivered=True,
                     next_notification_at=None,
@@ -844,6 +849,7 @@ class McpTaskService:
                 await self._repository.finish_notification_run(
                     task_id,
                     lease_owner=self._lease_owner,
+                    notification_lease_token=record["notification_lease_token"],
                     dispatch_version=dispatch_version,
                     delivered=False,
                     next_notification_at=now + timedelta(seconds=self._notification_retry_seconds(record)),
@@ -854,6 +860,7 @@ class McpTaskService:
                 await self._repository.defer_dispatched_notification(
                     task_id,
                     lease_owner=self._lease_owner,
+                    notification_lease_token=record["notification_lease_token"],
                     dispatch_version=dispatch_version,
                     next_notification_at=now + timedelta(seconds=self._poll_interval_seconds),
                     now=now,
@@ -875,6 +882,7 @@ class McpTaskService:
             await self._repository.dead_letter_notification(
                 task_id,
                 lease_owner=self._lease_owner,
+                notification_lease_token=record["notification_lease_token"],
                 dispatch_version=dispatch_version,
                 error=_bound_error(str(exc) or type(exc).__name__),
                 count_failure=True,
@@ -888,6 +896,7 @@ class McpTaskService:
                 release=lambda: self._repository.release_notification_claim(
                     task_id,
                     lease_owner=self._lease_owner,
+                    notification_lease_token=record["notification_lease_token"],
                     next_notification_at=now + timedelta(seconds=self._poll_interval_seconds),
                     error=retry_error,
                     replace_with_latest=True,
@@ -902,6 +911,7 @@ class McpTaskService:
                 release=lambda: self._repository.release_notification_claim(
                     task_id,
                     lease_owner=self._lease_owner,
+                    notification_lease_token=record["notification_lease_token"],
                     next_notification_at=now + timedelta(seconds=self._notification_retry_seconds(record)),
                     error=retry_error,
                     replace_with_latest=True,
@@ -913,6 +923,7 @@ class McpTaskService:
         await self._repository.mark_notification_dispatched(
             task_id,
             lease_owner=self._lease_owner,
+            notification_lease_token=record["notification_lease_token"],
             dispatch_version=dispatch_version,
             run_id=result["run_id"],
             now=now,
@@ -1046,6 +1057,7 @@ class McpTaskService:
             self._repository.release_notification_lease(
                 record["id"],
                 lease_owner=self._lease_owner,
+                notification_lease_token=record["notification_lease_token"],
                 next_notification_at=now + timedelta(seconds=self._notification_retry_seconds(record)),
                 error=error,
                 count_failure=True,
@@ -1084,6 +1096,7 @@ class McpTaskService:
             self._repository.release_cancel_claim(
                 record["id"],
                 lease_owner=self._lease_owner,
+                lease_token=record["lease_token"],
                 next_cancel_at=datetime.now(UTC),
                 error="cancelled",
             ),
@@ -1097,6 +1110,7 @@ class McpTaskService:
             compensation = self._repository.release_notification_lease(
                 task_id,
                 lease_owner=self._lease_owner,
+                notification_lease_token=record["notification_lease_token"],
                 next_notification_at=datetime.now(UTC),
                 error="cancelled",
                 count_failure=False,
@@ -1106,6 +1120,7 @@ class McpTaskService:
             compensation = self._repository.release_notification_claim(
                 task_id,
                 lease_owner=self._lease_owner,
+                notification_lease_token=record["notification_lease_token"],
                 next_notification_at=datetime.now(UTC),
                 error="cancelled",
                 replace_with_latest=False,
@@ -1122,6 +1137,7 @@ class McpTaskService:
             self._repository.release_poll_claim_after_cancellation(
                 record["id"],
                 lease_owner=self._lease_owner,
+                lease_token=record["lease_token"],
             ),
             action="release poll claim",
             task_id=record["id"],
@@ -1190,6 +1206,7 @@ class McpTaskService:
         applied = await self._repository.apply_snapshot(
             record["id"],
             lease_owner=self._lease_owner,
+            lease_token=record["lease_token"],
             status=snapshot.status.value,
             result=snapshot.result,
             result_preview=snapshot.result_preview,
@@ -1226,6 +1243,7 @@ class McpTaskService:
         await self._repository.release_claim(
             record["id"],
             lease_owner=self._lease_owner,
+            lease_token=record["lease_token"],
             next_poll_at=now + timedelta(seconds=retry_seconds),
             error=bounded_error,
             tracking_degraded_after_errors=self._tracking_degraded_after_errors,

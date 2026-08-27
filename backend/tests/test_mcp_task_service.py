@@ -172,6 +172,8 @@ def _claimed_row(*, driver_name="fake"):
         "status": "working",
         "driver_data": {"status_tool": "status"},
         "lease_owner": "ignored-by-service-fixture",
+        "lease_token": "lease-token-1",
+        "notification_lease_token": "notify-lease-token-1",
     }
 
 
@@ -2458,7 +2460,7 @@ async def test_poll_cancellation_releases_only_the_current_poll_lease():
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert repo.cancelled_releases == [("task-1", {"lease_owner": service._lease_owner})]
+    assert repo.cancelled_releases == [("task-1", {"lease_owner": service._lease_owner, "lease_token": "lease-token-1"})]
     assert repo.released == []
 
 
