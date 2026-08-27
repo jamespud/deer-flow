@@ -253,6 +253,7 @@ class RunJournal(BaseCallbackHandler):
         self._buffer: list[dict] = []
         self._pending_flush_tasks: set[asyncio.Task[None]] = set()
         self._detached_write_tasks: dict[asyncio.Future[Any], list[dict]] = {}
+        self._flush_lock = asyncio.Lock()
         self._pending_progress_task: asyncio.Task[None] | None = None
         self._pending_progress_delayed = False
         self._progress_dirty = False
@@ -998,6 +999,10 @@ class RunJournal(BaseCallbackHandler):
 
     async def flush(self) -> None:
         """Force flush remaining buffer. Called in worker's finally block."""
+        async with self._flush_lock:
+            await self._flush_locked()
+
+    async def _flush_locked(self) -> None:
         await self._await_write_predecessors()
         while self._pending_progress_task is not None and not self._pending_progress_task.done():
             if self._pending_progress_delayed:

@@ -906,6 +906,38 @@ class TestIdentifyCaller:
         assert j._identify_caller([]) == "lead_agent"
         assert j._identify_caller(None) == "lead_agent"
 
+    @pytest.mark.anyio
+    async def test_concurrent_explicit_flushes_do_not_write_concurrently(self):
+        class TrackingStore:
+            def __init__(self):
+                self.active = 0
+                self.max_active = 0
+                self.gate = asyncio.Event()
+                self.calls = []
+
+            async def put_batch(self, batch):
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+                self.calls.append([event.get("event_type") for event in batch])
+                await self.gate.wait()
+                self.active -= 1
+                return []
+
+        store = TrackingStore()
+        journal = RunJournal("r1", "t1", store, flush_threshold=1)
+        # Two batches in the buffer; two explicit flush() calls run together.
+        journal._buffer = [{"event_type": "a"}, {"event_type": "b"}]
+        first = asyncio.create_task(journal.flush())
+        second = asyncio.create_task(journal.flush())
+        try:
+            await asyncio.sleep(0.05)
+            assert store.max_active == 1
+        finally:
+            store.gate.set()
+            await asyncio.gather(first, second, return_exceptions=True)
+            await asyncio.sleep(0)
+        assert sorted(event_type for call in store.calls for event_type in call) == ["a", "b"]
+
 
 class TestChainErrorCallback:
     @pytest.mark.anyio
