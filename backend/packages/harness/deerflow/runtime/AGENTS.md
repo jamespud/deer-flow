@@ -168,6 +168,12 @@ retained owner consumes the eventual success, failure, or cancellation exactly
 once; it must not blindly retry or requeue an operation whose durable outcome is
 unknown.
 
+MCP claim and per-record release waits are bounded by the same drain deadline on
+the uncancelled poll path too: if a claim or release is still in flight when the
+deadline passes, it is retained by the compensation registry (or the batch
+release state) and the poller proceeds without blocking; lease expiry recovers
+any rows a late claim may have set.
+
 RunManager applies its caller-provided shutdown hard total budget across
 cancellation-cleanup producers, manager-lock waiters, in-flight run
 cancellation, heartbeat stop, orphan recovery, and trailing interrupted-status

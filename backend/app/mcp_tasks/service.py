@@ -192,7 +192,28 @@ class McpTaskService:
     ) -> None:
         state = _current_batch_record.get()
         if state is None:
-            await release()
+            release_task = asyncio.ensure_future(release())
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(release_task),
+                    timeout=_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                )
+            except asyncio.CancelledError:
+                if not release_task.done():
+                    release_task.cancel()
+                raise
+            except TimeoutError:
+                self._track_compensation_task(
+                    release_task,
+                    action=action,
+                    task_id=str(record.get("id") or "unknown"),
+                )
+                logger.warning(
+                    "Timed out after %.1f seconds waiting for MCP task release; it continues in the background (%s, task_id=%s)",
+                    _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                    action,
+                    record.get("id"),
+                )
             return
 
         if state.cancellation_release_task is not None:
@@ -218,12 +239,27 @@ class McpTaskService:
                 action=action,
             )
         try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            caller_cancelling = asyncio.current_task().cancelling()
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            # The release is still in flight past the drain deadline on the
+            # uncancelled path; it stays tracked by the batch state and settles
+            # in the background instead of blocking the poller.
             self._observe_batch_release_task(state, task, ordinary=True, action=action)
-            release_cancelled = state.ordinary_release_terminal or _task_has_cancelled_terminal_state(task)
-            if release_cancelled and not caller_cancelling:
+            logger.warning(
+                "Timed out after %.1f seconds waiting for MCP task release; it continues in the background (%s, task_id=%s)",
+                _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                action,
+                record.get("id"),
+            )
+            return
+        except asyncio.CancelledError:
+            self._observe_batch_release_task(state, task, ordinary=True, action=action)
+            if state.ordinary_release_terminal and not asyncio.current_task().cancelling():
+                # The release cancelled itself and the caller is not cancelling:
+                # consume it once and return without re-raising.
                 return
             raise
         except Exception:
@@ -952,7 +988,21 @@ class McpTaskService:
     ) -> list[dict[str, Any]]:
         claim_task = asyncio.ensure_future(claim)
         try:
-            return await asyncio.shield(claim_task)
+            return await asyncio.wait_for(
+                asyncio.shield(claim_task),
+                timeout=_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            # The claim is still in flight past the drain deadline on the
+            # uncancelled path; keep it supervised so a late claim or its error
+            # is not lost, and let lease expiry recover any claimed rows.
+            self._track_compensation_task(claim_task, action=action, task_id="batch")
+            logger.warning(
+                "Timed out after %.1f seconds waiting for MCP task claim; it continues in the background (%s, task_id=batch)",
+                _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                action,
+            )
+            return []
         except asyncio.CancelledError:
             caller_cancelling = asyncio.current_task().cancelling()
             claim_cancelled = _task_has_cancelled_terminal_state(claim_task)
@@ -1065,7 +1115,22 @@ class McpTaskService:
             name=f"mcp-release-notification-failure-{record.get('id', 'unknown')}",
         )
         try:
-            await asyncio.shield(task)
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            self._track_compensation_task(
+                task,
+                action="release notification failure",
+                task_id=record["id"],
+            )
+            logger.warning(
+                "Timed out after %.1f seconds waiting for MCP task notification release; it continues in the background (task_id=%s)",
+                _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                record["id"],
+            )
+            return
         except asyncio.CancelledError:
             caller_cancelling = asyncio.current_task().cancelling()
             release_cancelled = _task_has_cancelled_terminal_state(task)

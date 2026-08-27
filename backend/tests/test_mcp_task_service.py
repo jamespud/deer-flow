@@ -3596,3 +3596,246 @@ async def test_same_tick_outer_claim_cancellation_wins_and_preserves_args():
 
     assert caught.value.args == ("same tick claim cancellation",)
     assert not service._compensation_tasks
+
+
+@pytest.mark.asyncio
+async def test_poll_retry_release_hang_does_not_block_run_once(monkeypatch):
+    import app.mcp_tasks.service as service_module
+
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+    class HangingReleaseRepo(FakeRepository):
+        def __init__(self):
+            super().__init__([_claimed_row()])
+            self.release_started = asyncio.Event()
+            self.finish_release = asyncio.Event()
+            self.release_calls = 0
+
+        async def release_claim(self, task_id, **kwargs):
+            self.release_calls += 1
+            self.release_started.set()
+            await self.finish_release.wait()
+            return True
+
+    repo = HangingReleaseRepo()
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", FakeDriver(error=RuntimeError("poll failed")))
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    try:
+        await asyncio.wait_for(service.run_once(now=datetime.now(UTC)), timeout=0.2)
+    finally:
+        repo.finish_release.set()
+        await asyncio.sleep(0)
+
+    assert repo.release_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_notification_failure_release_hang_does_not_block(monkeypatch):
+    import app.mcp_tasks.service as service_module
+
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+    class HangingNotificationReleaseRepo:
+        def __init__(self, records):
+            self.records = list(records)
+            self.release_started = asyncio.Event()
+            self.finish_release = asyncio.Event()
+            self.release_calls = 0
+
+        async def claim_notification_work(self, **_kwargs):
+            return list(self.records)
+
+        async def release_notification_lease(self, task_id, **kwargs):
+            self.release_calls += 1
+            self.release_started.set()
+            await self.finish_release.wait()
+            return True
+
+    record = {
+        **_claimed_row(),
+        "notification_status": "dispatched",
+        "notification_run_id": "run-broken",
+        "dispatch_version": 3,
+    }
+    repo = HangingNotificationReleaseRepo([record])
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(),
+        get_run=AsyncMock(side_effect=RuntimeError("run store unavailable")),
+    )
+    try:
+        await asyncio.wait_for(service._run_notifications(now=datetime.now(UTC)), timeout=0.2)
+    finally:
+        repo.finish_release.set()
+        await asyncio.sleep(0)
+
+    assert repo.release_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_hang_does_not_block_run_once(monkeypatch):
+    import app.mcp_tasks.service as service_module
+
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+    class HangingClaimRepo(FakeRepository):
+        def __init__(self):
+            super().__init__()
+            self.claim_started = asyncio.Event()
+            self.finish_claim = asyncio.Event()
+
+        async def claim_due_tasks(self, **_kwargs):
+            self.claim_started.set()
+            await self.finish_claim.wait()
+            return []
+
+    repo = HangingClaimRepo()
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    try:
+        await asyncio.wait_for(service.run_once(now=datetime.now(UTC)), timeout=0.2)
+    finally:
+        repo.finish_claim.set()
+        await asyncio.sleep(0)
+
+    assert repo.claim_started.is_set()
+
+
+class FailingReleaseRepository(FakeRepository):
+    def __init__(self):
+        super().__init__([_claimed_row()])
+        self.release_called = False
+
+    async def release_claim(self, task_id, **kwargs):
+        self.release_called = True
+        raise RuntimeError("release db down")
+
+
+def test_failing_release_does_not_leak_unretrieved_shield_exception(tmp_path):
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    backend_dir = os.path.dirname(os.path.dirname(__file__))
+    probe = textwrap.dedent(
+        """
+        import asyncio, gc
+        from datetime import UTC, datetime
+        from app.mcp_tasks.service import McpTaskService
+        from deerflow.mcp.tasks import McpTaskDriverRegistry
+
+        class Repo:
+            def __init__(self):
+                self.row = {
+                    "id": "task-1", "user_id": "u", "thread_id": "t", "run_id": None,
+                    "tool_call_id": "c", "server_name": "s", "driver_name": "fake",
+                    "remote_task_id": "r", "task_name": "n", "status": "working",
+                    "driver_data": {}, "lease_owner": "o", "lease_token": "tok-1",
+                    "consecutive_poll_error_count": 0,
+                }
+                self.claimed = False
+
+            async def claim_due_tasks(self, **_kw):
+                if self.claimed:
+                    return []
+                self.claimed = True
+                return [dict(self.row)]
+
+            async def release_claim(self, task_id, **kw):
+                raise RuntimeError("release db down")
+
+        class Driver:
+            async def get_status(self, task):
+                raise RuntimeError("poll down")
+
+        async def scenario():
+            repo = Repo()
+            drivers = McpTaskDriverRegistry()
+            drivers.register("fake", Driver())
+            service = McpTaskService(
+                repository=repo, drivers=drivers,
+                poll_interval_seconds=5, lease_seconds=120, max_concurrent_polls=3,
+            )
+            await service.run_once(now=datetime.now(UTC))
+            del service, repo, drivers
+            for _ in range(20):
+                gc.collect()
+                await asyncio.sleep(0)
+
+        captured = []
+        loop = asyncio.new_event_loop()
+        try:
+            loop.set_exception_handler(lambda _loop, context: captured.append(context.get("message", "")))
+            loop.run_until_complete(scenario())
+        finally:
+            loop.close()
+        if any("Future exception was never retrieved" in message for message in captured):
+            print("UNRETRIEVED")
+        """
+    )
+    env = {**os.environ, "PYTHONPATH": backend_dir}
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        cwd=backend_dir,
+        env=env,
+    )
+    assert "UNRETRIEVED" not in result.stdout, result.stderr
+
+
+@pytest.mark.asyncio
+async def test_poll_release_hang_without_batch_is_bounded(monkeypatch):
+    import app.mcp_tasks.service as service_module
+
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+    class HangingReleaseRepo(FakeRepository):
+        def __init__(self):
+            super().__init__([_claimed_row()])
+            self.release_started = asyncio.Event()
+            self.finish_release = asyncio.Event()
+
+        async def release_claim(self, task_id, **kwargs):
+            self.release_started.set()
+            await self.finish_release.wait()
+            return True
+
+    repo = HangingReleaseRepo()
+    drivers = McpTaskDriverRegistry()
+    drivers.register("fake", FakeDriver(error=RuntimeError("poll failed")))
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    try:
+        # Direct single-record path (no batch context) must still be bounded.
+        await asyncio.wait_for(
+            service._poll_one(_claimed_row(), now=datetime.now(UTC)),
+            timeout=0.2,
+        )
+    finally:
+        repo.finish_release.set()
+        await asyncio.sleep(0)
+
+    assert repo.release_started.is_set()
