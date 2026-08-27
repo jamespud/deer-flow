@@ -685,25 +685,27 @@ class RunJournal(BaseCallbackHandler):
         task.add_done_callback(lambda completed: self._on_flush_done(completed, detached=detached))
 
     async def _put_batch_cancellation_safe(self, batch: list[dict]) -> None:
-        """Drain an in-flight write before deciding whether its batch can be retried."""
+        """Write one batch, bounded by a drain deadline whether or not the caller is cancelled."""
         write_task = asyncio.create_task(self._store.put_batch(batch))
         write_task.set_name(f"deerflow-journal-put-batch-{self.run_id}")
-        try:
-            await asyncio.shield(write_task)
-        except asyncio.CancelledError:
-            completed = await wait_for_task_until(
-                write_task,
-                deadline=asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+        deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+        completed = await wait_for_task_until(write_task, deadline=deadline)
+        caller_cancelling = asyncio.current_task().cancelling() > 0
+        if not completed:
+            # The write is still in flight past the deadline: hand ownership to
+            # the detached registry so it settles in the background, then
+            # surface the caller's cancellation (if any) without blocking.
+            self._track_detached_write(write_task, batch)
+            logger.warning(
+                "Timed out after %.1f seconds waiting for journal write for run %s; %d events continue in the background",
+                _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                self.run_id,
+                len(batch),
             )
-            if not completed:
-                self._track_detached_write(write_task, batch)
-                logger.warning(
-                    "Timed out after %.1f seconds draining journal write for run %s; %d events remain owned by the background write",
-                    _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
-                    self.run_id,
-                    len(batch),
-                )
-                raise
+            if caller_cancelling:
+                raise asyncio.CancelledError
+            return
+        if caller_cancelling:
             try:
                 write_task.result()
             except asyncio.CancelledError:
@@ -721,6 +723,16 @@ class RunJournal(BaseCallbackHandler):
                     exc_info=(type(error), error, error.__traceback__),
                 )
                 self._buffer = batch + self._buffer
+            raise asyncio.CancelledError
+        try:
+            write_task.result()
+        except asyncio.CancelledError:
+            logger.warning(
+                "Journal write was cancelled for run %s; returning %d events to buffer",
+                self.run_id,
+                len(batch),
+            )
+            self._buffer = batch + self._buffer
             raise
 
     def _track_detached_write(self, task: asyncio.Future[Any], batch: list[dict]) -> None:
@@ -749,49 +761,26 @@ class RunJournal(BaseCallbackHandler):
         )
         self._buffer = batch + self._buffer
 
-    async def _await_detached_writes(self) -> None:
-        """Observe detached predecessors without cancelling them on caller cancellation."""
-        tasks = tuple(self._detached_write_tasks)
-        if not tasks:
-            return
-        try:
-            await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
-        except asyncio.CancelledError:
-            deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
-            for task in tasks:
+    async def _await_write_predecessors(self) -> None:
+        """Observe pending and detached writes, bounded, without cancelling them."""
+        deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+        while True:
+            detached = tuple(self._detached_write_tasks)
+            pending = tuple(self._pending_flush_tasks)
+            if not detached and not pending:
+                break
+            for task in detached:
                 if await wait_for_task_until(task, deadline=deadline):
                     self._resolve_detached_write(task)
-            raise
-        for task in tasks:
-            self._resolve_detached_write(task)
-
-    async def _await_pending_flush_tasks(self) -> None:
-        """Observe threshold flushes without letting caller cancellation cancel them."""
-        tasks = tuple(self._pending_flush_tasks)
-        if not tasks:
-            return
-        try:
-            await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
-        except asyncio.CancelledError:
-            deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
-            for task in tasks:
+            for task in pending:
                 await wait_for_task_until(task, deadline=deadline)
-            raise
-
-    async def _await_write_predecessors(self) -> None:
-        """Observe pending and detached writes until no predecessor can appear."""
-        while True:
-            has_detached_writes = bool(self._detached_write_tasks)
-            has_pending_flushes = bool(self._pending_flush_tasks)
-            if not has_detached_writes and not has_pending_flushes:
-                return
-            if has_detached_writes:
-                await self._await_detached_writes()
-            if has_pending_flushes:
-                await self._await_pending_flush_tasks()
             # Let completion callbacks move a cancelled threshold write into
             # the detached registry before checking the fixed point again.
             await asyncio.sleep(0)
+            if asyncio.get_running_loop().time() >= deadline:
+                break
+        if asyncio.current_task().cancelling() > 0:
+            raise asyncio.CancelledError
 
     async def _flush_async(self, batch: list[dict], *, detached: _DetachedFlush | None = None) -> None:
         if detached is not None:

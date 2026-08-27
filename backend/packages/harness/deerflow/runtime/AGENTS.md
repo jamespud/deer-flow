@@ -207,10 +207,13 @@ while that owner is still live.
 
 `RunJournal` transfers each detached batch to a dedicated `put_batch` task and
 shields that task from caller cancellation. Threshold flushes and the worker's
-final explicit `flush()` serialize all pending and detached predecessors before
-starting a later write; a normal, uncancelled flush may wait for that serialized
-predecessor. A later flush that is itself cancelled only observes predecessors
-through its bounded drain deadline. A successful write is discarded from the
+final explicit `flush()` serialize pending and detached predecessors before
+starting a later write, and that observation is bounded by the same drain
+deadline whether or not the caller is cancelled; a predecessor that is still
+hung when the deadline passes stays owned by its supervised background task and
+the flush proceeds instead of blocking shutdown. A later flush that is itself
+cancelled only observes predecessors through that same bounded drain deadline.
+A successful write is discarded from the
 detached registry; a late explicit failure or self-cancellation prepends its
 batch exactly once. No automatic retry is launched. If the write remains
 ambiguous after its drain deadline, ownership stays with its supervised
