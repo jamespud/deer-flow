@@ -228,3 +228,8 @@ database commit cannot be duplicated by a blind retry. If a scheduled flush is
 cancelled before its first coroutine step, its completion callback restores the
 still-unowned detached batch instead. Do not reintroduce a direct
 `except CancelledError: requeue` around event-store writes.
+An in-flight progress snapshot write is observed through the same bounded
+drain deadline during the final flush; if the store hangs past the deadline the
+snapshot stays owned by its background task and the flush proceeds, so a hung
+`update_run_progress` cannot block run finalization or the buffered delivery
+events. Delayed progress snapshots are cancelled by `flush()` as before.

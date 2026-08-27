@@ -1500,6 +1500,54 @@ class TestProgressSnapshots:
         assert snapshots[-1]["llm_call_count"] == 1
         assert snapshots[-1]["last_ai_message"] == "First"
 
+    @pytest.mark.anyio
+    async def test_flush_bounds_hung_progress_reporter_and_still_writes_buffer(self, monkeypatch):
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+        class HangingReporter:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.finish = asyncio.Event()
+
+            async def __call__(self, snapshot):
+                self.started.set()
+                await self.finish.wait()
+
+        class CountingStore:
+            def __init__(self):
+                self.put_calls = 0
+                self.gate = asyncio.Event()
+
+            async def put_batch(self, batch):
+                self.put_calls += 1
+                await self.gate.wait()
+                return []
+
+        reporter = HangingReporter()
+        store = CountingStore()
+        j = RunJournal(
+            "r1",
+            "t1",
+            store,
+            flush_threshold=100,
+            progress_reporter=reporter,
+            progress_flush_interval=0.01,
+        )
+        j.record_delivery()
+        j._schedule_progress_flush()
+        await reporter.started.wait()
+        try:
+            # A hung progress reporter must not block flush() past the drain
+            # deadline, and the buffered delivery event must still be written.
+            await asyncio.wait_for(j.flush(), timeout=0.2)
+            assert store.put_calls == 1
+        finally:
+            reporter.finish.set()
+            store.gate.set()
+            await asyncio.sleep(0)
+
 
 class TestChatModelStartHumanMessage:
     """Tests for on_chat_model_start extracting the first human message."""

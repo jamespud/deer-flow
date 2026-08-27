@@ -1011,7 +1011,26 @@ class RunJournal(BaseCallbackHandler):
                 self._progress_dirty = False
                 self._pending_progress_delayed = False
                 break
-            await asyncio.gather(self._pending_progress_task, return_exceptions=True)
+            # A progress snapshot write that is in flight (not merely delayed)
+            # is observed through the same bounded drain deadline so a hung
+            # store cannot block the worker's final flush. If it is still
+            # running when the deadline passes it stays owned by its task and
+            # settles in the background.
+            done, _ = await asyncio.wait(
+                {asyncio.shield(self._pending_progress_task)},
+                timeout=_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+            )
+            if not done:
+                logger.warning(
+                    "Timed out after %.1f seconds waiting for run progress snapshot for run %s; it continues in the background",
+                    _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                    self.run_id,
+                )
+                break
+            # Take back the shield future's result so its exception is not
+            # left unretrieved; the progress task already logs its own errors.
+            next(iter(done)).exception()
+            break
 
         while self._buffer:
             batch = self._buffer[: self._flush_threshold]
