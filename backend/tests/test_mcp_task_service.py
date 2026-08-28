@@ -2497,6 +2497,50 @@ async def _wait_for_compensation_tasks_to_clear(service: McpTaskService) -> None
 
 
 @pytest.mark.asyncio
+async def test_settled_cancellation_compensation_can_stop_without_losing_release():
+    release_started = asyncio.Event()
+    release_gate = asyncio.Event()
+
+    async def release():
+        release_started.set()
+        await release_gate.wait()
+
+    service = McpTaskService(
+        repository=SimpleNamespace(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    caller = asyncio.create_task(
+        service._drain_cancellation_compensation(
+            release(),
+            action="release late claim",
+            task_id="task-1",
+            settle=True,
+        )
+    )
+    await release_started.wait()
+    caller.cancel("service shutdown")
+
+    try:
+        await asyncio.sleep(0)
+        assert caller.done()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await caller
+        assert caught.value.args == ("service shutdown",)
+        assert len(service._compensation_tasks) == 1
+
+        release_gate.set()
+        await _wait_for_compensation_tasks_to_clear(service)
+    finally:
+        release_gate.set()
+        if not caller.done():
+            await caller
+        await _wait_for_compensation_tasks_to_clear(service)
+
+
+@pytest.mark.asyncio
 async def test_cancelled_hung_claim_returns_then_releases_delayed_result(monkeypatch):
     monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
     claim_started = asyncio.Event()
@@ -2508,7 +2552,8 @@ async def test_cancelled_hung_claim_returns_then_releases_delayed_result(monkeyp
         await claim_gate.wait()
         return [_claimed_row()]
 
-    async def release(record):
+    async def release(record, *, settle=False):
+        assert settle is True
         release_calls.append(record["id"])
 
     service = McpTaskService(
@@ -2520,7 +2565,8 @@ async def test_cancelled_hung_claim_returns_then_releases_delayed_result(monkeyp
     )
     caller = asyncio.create_task(
         service._claim_with_cancellation_release(
-            claim(),
+            claim,
+            phase="probe",
             action="probe claim",
             release=release,
         )
@@ -2545,6 +2591,201 @@ async def test_cancelled_hung_claim_returns_then_releases_delayed_result(monkeyp
         if not caller.done():
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(caller, timeout=0.2)
+        await _wait_for_compensation_tasks_to_clear(service)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["poll", "cancel", "notification"])
+async def test_single_flight_claim_releases_late_uncancelled_claim(phase, monkeypatch):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+
+    class BlockingClaimRepository:
+        def __init__(self):
+            self.claim_calls = {"poll": 0, "cancel": 0, "notification": 0}
+            self.claim_started = asyncio.Event()
+            self.claim_gate = asyncio.Event()
+            self.released: list[tuple[str, str, dict]] = []
+
+        async def _claim(self, claim_phase):
+            self.claim_calls[claim_phase] += 1
+            self.claim_started.set()
+            await self.claim_gate.wait()
+            return [{**_claimed_row(), "notification_status": "pending"}]
+
+        async def claim_due_tasks(self, **_kwargs):
+            return await self._claim("poll")
+
+        async def claim_cancel_requests(self, **_kwargs):
+            return await self._claim("cancel")
+
+        async def claim_notification_work(self, **_kwargs):
+            return await self._claim("notification")
+
+        async def release_poll_claim_after_cancellation(self, task_id, **kwargs):
+            self.released.append(("poll", task_id, kwargs))
+            return True
+
+        async def release_cancel_claim(self, task_id, **kwargs):
+            self.released.append(("cancel", task_id, kwargs))
+            return True
+
+        async def release_notification_claim(self, task_id, **kwargs):
+            self.released.append(("notification", task_id, kwargs))
+            return True
+
+    repo = BlockingClaimRepository()
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    claim_factories = {
+        "poll": lambda: repo.claim_due_tasks(),
+        "cancel": lambda: repo.claim_cancel_requests(),
+        "notification": lambda: repo.claim_notification_work(),
+    }
+    releases = {
+        "poll": service._release_poll_after_cancellation,
+        "cancel": service._release_cancel_after_cancellation,
+        "notification": service._release_notification_after_cancellation,
+    }
+
+    async def claim_once():
+        return await service._claim_with_cancellation_release(
+            claim_factories[phase],
+            phase=phase,
+            action=f"{phase} claim",
+            release=releases[phase],
+        )
+
+    try:
+        assert await claim_once() == []
+        await repo.claim_started.wait()
+        assert await claim_once() == []
+        assert await claim_once() == []
+        assert repo.claim_calls[phase] == 1
+        assert list(service._claim_owners) == [phase]
+
+        repo.claim_gate.set()
+        async with asyncio.timeout(0.2):
+            while service._claim_owners:
+                await asyncio.sleep(0)
+
+        assert [(released_phase, task_id) for released_phase, task_id, _ in repo.released] == [(phase, "task-1")]
+        assert repo.released[0][2]["lease_owner"] == service._lease_owner
+        token_key = "notification_lease_token" if phase == "notification" else "lease_token"
+        assert repo.released[0][2][token_key] == ("notify-lease-token-1" if phase == "notification" else "lease-token-1")
+
+        claimed = await claim_once()
+        assert [record["id"] for record in claimed] == ["task-1"]
+        assert repo.claim_calls[phase] == 2
+        assert not service._claim_owners
+    finally:
+        repo.claim_gate.set()
+        owners = tuple(getattr(service, "_claim_owners", {}).values())
+        handoffs = [owner.handoff_task for owner in owners if owner.handoff_task is not None]
+        if handoffs:
+            await asyncio.gather(*handoffs, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["poll", "cancel", "notification"])
+async def test_single_flight_claim_keeps_owner_until_late_release_settles(phase, monkeypatch):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+
+    class BlockingClaimAndReleaseRepository:
+        def __init__(self):
+            self.claim_calls = {"poll": 0, "cancel": 0, "notification": 0}
+            self.claim_started = asyncio.Event()
+            self.claim_gate = asyncio.Event()
+            self.release_started = asyncio.Event()
+            self.release_gate = asyncio.Event()
+
+        async def _claim(self, claim_phase):
+            self.claim_calls[claim_phase] += 1
+            self.claim_started.set()
+            await self.claim_gate.wait()
+            return [{**_claimed_row(), "notification_status": "pending"}]
+
+        async def claim_due_tasks(self, **_kwargs):
+            return await self._claim("poll")
+
+        async def claim_cancel_requests(self, **_kwargs):
+            return await self._claim("cancel")
+
+        async def claim_notification_work(self, **_kwargs):
+            return await self._claim("notification")
+
+        async def _release(self):
+            self.release_started.set()
+            await self.release_gate.wait()
+            return True
+
+        async def release_poll_claim_after_cancellation(self, _task_id, **_kwargs):
+            return await self._release()
+
+        async def release_cancel_claim(self, _task_id, **_kwargs):
+            return await self._release()
+
+        async def release_notification_claim(self, _task_id, **_kwargs):
+            return await self._release()
+
+    repo = BlockingClaimAndReleaseRepository()
+    service = McpTaskService(
+        repository=repo,
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    claim_factories = {
+        "poll": lambda: repo.claim_due_tasks(),
+        "cancel": lambda: repo.claim_cancel_requests(),
+        "notification": lambda: repo.claim_notification_work(),
+    }
+    releases = {
+        "poll": service._release_poll_after_cancellation,
+        "cancel": service._release_cancel_after_cancellation,
+        "notification": service._release_notification_after_cancellation,
+    }
+
+    async def claim_once():
+        return await service._claim_with_cancellation_release(
+            claim_factories[phase],
+            phase=phase,
+            action=f"{phase} claim",
+            release=releases[phase],
+        )
+
+    try:
+        assert await claim_once() == []
+        await repo.claim_started.wait()
+
+        repo.claim_gate.set()
+        await repo.release_started.wait()
+        await asyncio.sleep(0.02)
+
+        assert list(service._claim_owners) == [phase]
+        assert await claim_once() == []
+        assert repo.claim_calls[phase] == 1
+
+        repo.release_gate.set()
+        async with asyncio.timeout(0.2):
+            while service._claim_owners:
+                await asyncio.sleep(0)
+
+        claimed = await claim_once()
+        assert [record["id"] for record in claimed] == ["task-1"]
+        assert repo.claim_calls[phase] == 2
+    finally:
+        repo.claim_gate.set()
+        repo.release_gate.set()
+        owners = tuple(getattr(service, "_claim_owners", {}).values())
+        handoffs = [owner.handoff_task for owner in owners if owner.handoff_task is not None]
+        if handoffs:
+            await asyncio.gather(*handoffs, return_exceptions=True)
         await _wait_for_compensation_tasks_to_clear(service)
 
 
@@ -3585,7 +3826,8 @@ async def test_same_tick_outer_claim_cancellation_wins_and_preserves_args():
     )
     caller = asyncio.create_task(
         service._claim_with_cancellation_release(
-            claim(),
+            claim,
+            phase="poll",
             action="poll claim",
             release=AsyncMock(),
         )

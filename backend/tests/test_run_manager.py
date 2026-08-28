@@ -486,6 +486,33 @@ async def test_shutdown_observes_supervised_cleanup_only_within_budget(caplog: p
 
 
 @pytest.mark.anyio
+async def test_shutdown_observes_background_finalization_only_within_budget(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    finish_finalization = asyncio.Event()
+
+    async def wait_for_finalization() -> bool:
+        await finish_finalization.wait()
+        return True
+
+    finalization = asyncio.create_task(wait_for_finalization())
+    manager.track_background_finalization(finalization, action="test finalization", run_id="run-1")
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    with caplog.at_level(logging.WARNING):
+        await manager.shutdown(timeout=0.01)
+
+    assert loop.time() - started < 0.2
+    assert finalization.done() is False
+    assert finalization in manager._background_finalization_tasks
+    assert "background finalization task" in caplog.text
+    finish_finalization.set()
+    assert await finalization is True
+    await asyncio.sleep(0)
+    assert not manager._background_finalization_tasks
+
+
+@pytest.mark.anyio
 async def test_shutdown_observes_cleanup_registered_by_cancelled_run_before_deadline():
     manager = RunManager()
     cleanup_finished = asyncio.Event()

@@ -690,8 +690,10 @@ class RunJournal(BaseCallbackHandler):
         write_task = asyncio.create_task(self._store.put_batch(batch))
         write_task.set_name(f"deerflow-journal-put-batch-{self.run_id}")
         deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+        current_task = asyncio.current_task()
+        cancelling_on_entry = current_task.cancelling() if current_task is not None else 0
         completed = await wait_for_task_until(write_task, deadline=deadline)
-        caller_cancelling = asyncio.current_task().cancelling() > 0
+        caller_cancelling = current_task is not None and current_task.cancelling() > cancelling_on_entry
         if not completed:
             # The write is still in flight past the deadline: hand ownership to
             # the detached registry so it settles in the background, then
@@ -762,26 +764,36 @@ class RunJournal(BaseCallbackHandler):
         )
         self._buffer = batch + self._buffer
 
-    async def _await_write_predecessors(self) -> None:
-        """Observe pending and detached writes, bounded, without cancelling them."""
-        deadline = asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+    async def _await_write_predecessors(self, *, settle: bool) -> bool:
+        """Observe predecessor writes without cancelling or overtaking them."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS
+        current_task = asyncio.current_task()
+        cancelling_on_entry = current_task.cancelling() if current_task is not None else 0
         while True:
             detached = tuple(self._detached_write_tasks)
             pending = tuple(self._pending_flush_tasks)
             if not detached and not pending:
-                break
+                return True
             for task in detached:
-                if await wait_for_task_until(task, deadline=deadline):
+                if settle:
+                    await asyncio.wait({task})
+                    self._resolve_detached_write(task)
+                elif await wait_for_task_until(task, deadline=deadline):
                     self._resolve_detached_write(task)
             for task in pending:
-                await wait_for_task_until(task, deadline=deadline)
+                if settle:
+                    await asyncio.wait({task})
+                else:
+                    await wait_for_task_until(task, deadline=deadline)
             # Let completion callbacks move a cancelled threshold write into
             # the detached registry before checking the fixed point again.
             await asyncio.sleep(0)
-            if asyncio.get_running_loop().time() >= deadline:
-                break
-        if asyncio.current_task().cancelling() > 0:
-            raise asyncio.CancelledError
+            if not settle:
+                if current_task is not None and current_task.cancelling() > cancelling_on_entry:
+                    raise asyncio.CancelledError
+                if loop.time() >= deadline:
+                    return not self._detached_write_tasks and not self._pending_flush_tasks
 
     async def _flush_async(self, batch: list[dict], *, detached: _DetachedFlush | None = None) -> None:
         if detached is not None:
@@ -1002,44 +1014,76 @@ class RunJournal(BaseCallbackHandler):
         async with self._flush_lock:
             await self._flush_locked()
 
-    async def _flush_locked(self) -> None:
-        await self._await_write_predecessors()
-        while self._pending_progress_task is not None and not self._pending_progress_task.done():
-            if self._pending_progress_delayed:
-                self._pending_progress_task.cancel()
-                await asyncio.gather(self._pending_progress_task, return_exceptions=True)
+    async def flush_until_settled(self) -> None:
+        """Flush in order after every ambiguous predecessor has settled."""
+        async with self._flush_lock:
+            await self._flush_locked(settle_predecessors=True)
+
+    async def _flush_locked(self, *, settle_predecessors: bool = False) -> None:
+        while True:
+            predecessors_settled = await self._await_write_predecessors(settle=settle_predecessors)
+            if not predecessors_settled:
+                return
+            await self._quiesce_progress()
+
+            while self._buffer:
+                batch = self._buffer[: self._flush_threshold]
+                del self._buffer[: self._flush_threshold]
+                try:
+                    await self._put_batch_cancellation_safe(batch)
+                except Exception:
+                    self._buffer = batch + self._buffer
+                    raise
+                if settle_predecessors and (self._detached_write_tasks or self._pending_flush_tasks):
+                    break
+
+            if not settle_predecessors or not (self._buffer or self._detached_write_tasks or self._pending_flush_tasks):
+                return
+
+    async def _quiesce_progress(self) -> None:
+        while True:
+            progress_task = self._pending_progress_task
+            if progress_task is None:
+                return
+            if self._pending_progress_delayed and not progress_task.done():
+                progress_task.cancel()
+                await asyncio.gather(progress_task, return_exceptions=True)
                 self._progress_dirty = False
                 self._pending_progress_delayed = False
-                break
-            # A progress snapshot write that is in flight (not merely delayed)
-            # is observed through the same bounded drain deadline so a hung
-            # store cannot block the worker's final flush. If it is still
-            # running when the deadline passes it stays owned by its task and
-            # settles in the background.
-            done, _ = await asyncio.wait(
-                {asyncio.shield(self._pending_progress_task)},
-                timeout=_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
-            )
-            if not done:
-                logger.warning(
-                    "Timed out after %.1f seconds waiting for run progress snapshot for run %s; it continues in the background",
-                    _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
-                    self.run_id,
+                if self._pending_progress_task is progress_task:
+                    self._pending_progress_task = None
+            elif not progress_task.done():
+                # A progress snapshot write that is in flight (not merely
+                # delayed) is observed through the same bounded drain deadline
+                # so a hung store cannot block the worker's final flush.
+                done, _ = await asyncio.wait(
+                    {asyncio.shield(progress_task)},
+                    timeout=_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
                 )
-                break
-            # Take back the shield future's result so its exception is not
-            # left unretrieved; the progress task already logs its own errors.
-            next(iter(done)).exception()
-            break
+                if not done:
+                    logger.warning(
+                        "Timed out after %.1f seconds waiting for run progress snapshot for run %s; it continues in the background",
+                        _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                        self.run_id,
+                    )
+                    return
+                completed = next(iter(done))
+                try:
+                    completed.exception()
+                except asyncio.CancelledError:
+                    pass
+            else:
+                try:
+                    progress_task.exception()
+                except asyncio.CancelledError:
+                    pass
 
-        while self._buffer:
-            batch = self._buffer[: self._flush_threshold]
-            del self._buffer[: self._flush_threshold]
-            try:
-                await self._put_batch_cancellation_safe(batch)
-            except Exception:
-                self._buffer = batch + self._buffer
-                raise
+            # A completed progress write may install a delayed replacement.
+            # Give it one turn, then re-read the journal-owned task instead of
+            # assuming the task observed above is still current.
+            await asyncio.sleep(0)
+            if self._pending_progress_task is progress_task:
+                return
 
     def _schedule_progress_flush(self) -> None:
         """Best-effort throttled progress snapshot for active run visibility."""

@@ -260,6 +260,7 @@ class RunManager:
         self._cancellation_cleanup_tasks: set[asyncio.Future[None]] = set()
         self._cancellation_cleanup_producers: set[object] = set()
         self._cancellation_cleanup_state_changed = asyncio.Event()
+        self._background_finalization_tasks: set[asyncio.Future[Any]] = set()
         self._shutdown_persistence_tasks: set[asyncio.Task[bool | BaseException]] = set()
         self._shutdown_persistence_records: dict[asyncio.Task[bool | BaseException], RunRecord] = {}
         self._shutdown_persistence_observed: weakref.WeakSet[asyncio.Task[bool | BaseException]] = weakref.WeakSet()
@@ -313,6 +314,36 @@ class RunManager:
                 return
             logger.error(
                 "Run cancellation cleanup failed (%s, run_id=%s): %s",
+                action,
+                run_id,
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+        task.add_done_callback(finalize)
+
+    def track_background_finalization(
+        self,
+        task: asyncio.Future[Any],
+        *,
+        action: str,
+        run_id: str,
+    ) -> None:
+        """Keep an ordered finalization pipeline alive until it settles."""
+        if task in self._background_finalization_tasks:
+            return
+        self._background_finalization_tasks.add(task)
+
+        def finalize(completed: asyncio.Future[Any]) -> None:
+            self._background_finalization_tasks.discard(completed)
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError as exc:
+                error = exc
+            if error is None:
+                return
+            logger.error(
+                "Run background finalization failed (%s, run_id=%s): %s",
                 action,
                 run_id,
                 error,
@@ -2640,7 +2671,8 @@ class RunManager:
         while True:
             active_run_tasks = {task for task in run_tasks if task is not None and not task.done()}
             active_cleanup_tasks = {task for task in self._cancellation_cleanup_tasks if not task.done()}
-            owned_tasks = active_run_tasks | active_cleanup_tasks
+            active_finalization_tasks = {task for task in self._background_finalization_tasks if not task.done()}
+            owned_tasks = active_run_tasks | active_cleanup_tasks | active_finalization_tasks
             if owned_tasks:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
@@ -2712,6 +2744,12 @@ class RunManager:
             logger.warning(
                 "Run shutdown deadline expired with %d cancellation cleanup task(s) still supervised",
                 pending_cleanup_count,
+            )
+        pending_finalization_count = sum(1 for task in self._background_finalization_tasks if not task.done())
+        if pending_finalization_count:
+            logger.warning(
+                "Run shutdown deadline expired with %d background finalization task(s) still supervised",
+                pending_finalization_count,
             )
         if pending_run_tasks:
             logger.warning("Run drain exceeded %.1fs on shutdown; %d run task(s) still active and may race checkpointer teardown", timeout, len(pending_run_tasks))

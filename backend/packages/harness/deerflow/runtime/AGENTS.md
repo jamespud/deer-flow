@@ -169,15 +169,21 @@ once; it must not blindly retry or requeue an operation whose durable outcome is
 unknown.
 
 MCP claim and per-record release waits are bounded by the same drain deadline on
-the uncancelled poll path too: if a claim or release is still in flight when the
-deadline passes, it is retained by the compensation registry (or the batch
-release state) and the poller proceeds without blocking; lease expiry recovers
-any rows a late claim may have set.
+the uncancelled poll path too. Poll, cancel, and notification each keep one
+phase-level claim owner: a timed-out claim stays single-flight, later scans do
+not start another repository claim, and its handoff releases every late row
+through the phase-specific owner-plus-token fence before clearing ownership.
+Lease expiry remains crash recovery, not the normal in-process late-claim path.
+Per-record release timeouts remain owned by the compensation registry or batch
+release state while the poller proceeds.
 
 RunManager applies its caller-provided shutdown hard total budget across
 cancellation-cleanup producers, manager-lock waiters, in-flight run
 cancellation, heartbeat stop, orphan recovery, and trailing interrupted-status
-persistence. Lock waiters are
+persistence. It also observes the worker's ordered journal-plus-receipt
+finalization tasks only within that same top-level deadline; unfinished tasks
+remain strongly owned and are never cancelled merely because shutdown timed
+out. Lock waiters are
 cancelled once, tracked until a late result arrives, and release the manager
 lock at most once if they acquire it after the foreground deadline. Heartbeat
 and orphan tasks keep one background owner after a timed-out stop, while late
@@ -212,13 +218,13 @@ while that owner is still live.
 ### Cancellation-Safe Run Journal Writes
 
 `RunJournal` transfers each detached batch to a dedicated `put_batch` task and
-shields that task from caller cancellation. Threshold flushes and the worker's
-final explicit `flush()` serialize pending and detached predecessors before
-starting a later write, and that observation is bounded by the same drain
-deadline whether or not the caller is cancelled; a predecessor that is still
-hung when the deadline passes stays owned by its supervised background task and
-the flush proceeds instead of blocking shutdown. A later flush that is itself
-cancelled only observes predecessors through that same bounded drain deadline.
+shields that task from caller cancellation. Ordinary `flush()` observes pending
+and detached predecessors only through the bounded drain deadline; if one stays
+ambiguous it returns with every successor still buffered, so a timeout never
+authorizes an overtaking write or retry. A later bounded flush applies the same
+rule. `flush_until_settled()` is the worker-only path: it waits for predecessor
+outcomes, lets explicit failures restore their batch, and drains restored plus
+later events in order.
 A successful write is discarded from the
 detached registry; a late explicit failure or self-cancellation prepends its
 batch exactly once. No automatic retry is launched. If the write remains
@@ -228,8 +234,18 @@ database commit cannot be duplicated by a blind retry. If a scheduled flush is
 cancelled before its first coroutine step, its completion callback restores the
 still-unowned detached batch instead. Do not reintroduce a direct
 `except CancelledError: requeue` around event-store writes.
-An in-flight progress snapshot write is observed through the same bounded
-drain deadline during the final flush; if the store hangs past the deadline the
-snapshot stays owned by its background task and the flush proceeds, so a hung
-`update_run_progress` cannot block run finalization or the buffered delivery
-events. Delayed progress snapshots are cancelled by `flush()` as before.
+Progress quiescence consumes a progress task's own cancellation, re-reads the
+current task after completion, and cancels any delayed replacement it created;
+a hung in-flight snapshot remains owned after its bounded observation and does
+not block buffered events. Cancellation checks compare the task's count before
+and after an absorbing wait, so an already-handled historical request is not
+raised as a new cancellation.
+
+The worker computes delivery content, starts one child pipeline that calls
+`flush_until_settled()` and only then writes the idempotent `run.delivery`
+receipt, and immediately registers it with `RunManager`. The worker observes
+that whole pipeline for five seconds. On timeout the exact task continues under
+manager ownership while later finalization stages proceed; the receipt cannot
+enter the event store ahead of an unresolved journal write, and produced
+artifacts treat the unconfirmed receipt as fail-closed. Shutdown observes the
+same owner only within its caller-provided absolute deadline.

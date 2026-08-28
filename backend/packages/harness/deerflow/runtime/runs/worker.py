@@ -38,6 +38,7 @@ from deerflow.agents.middlewares.input_sanitization_middleware import neutralize
 from deerflow.config.app_config import AppConfig
 from deerflow.config.database_config import CheckpointChannelMode
 from deerflow.constants import TOOL_RESULTS_DIRNAME
+from deerflow.runtime.cancellation import wait_for_task_until
 from deerflow.runtime.checkpoint_mode import (
     aensure_checkpoint_mode_compatible,
     inject_checkpoint_mode,
@@ -112,6 +113,7 @@ async def _checkpoint_thread_lock(thread_id: str) -> AsyncIterator[None]:
 
 
 _DELIVERY_RECEIPT_RETRY_DELAYS_SECONDS = (0.1, 0.5)
+_FINALIZATION_DRAIN_TIMEOUT_SECONDS = 5.0
 _EXTENSION_TASK_NOTIFY_TIMEOUT_SECONDS = 3.0
 
 
@@ -174,6 +176,24 @@ async def _persist_delivery_receipt(
             await asyncio.sleep(delay)
 
     return False  # pragma: no cover - loop always returns
+
+
+async def _persist_journal_and_delivery_receipt(
+    journal: Any,
+    event_store: Any,
+    *,
+    thread_id: str,
+    run_id: str,
+    content: dict[str, Any],
+) -> bool:
+    """Persist buffered events and the singleton receipt in strict order."""
+    await journal.flush_until_settled()
+    return await _persist_delivery_receipt(
+        event_store,
+        thread_id=thread_id,
+        run_id=run_id,
+        content=content,
+    )
 
 
 _DELIVERY_INCOMPLETE_ERROR = "Artifact delivery incomplete: no produced output artifact was presented"
@@ -1199,11 +1219,6 @@ async def run_agent(
         # crash window where a terminal run could otherwise outlive its receipt.
         # A fenced worker leaves receipt recovery to the peer that claimed it.
         if not record.ownership_lost and journal is not None:
-            try:
-                await journal.flush()
-            except Exception:
-                logger.warning("Failed to flush journal for run %s", run_id, exc_info=True)
-
             if delivery_content is None:
                 if produced_output_paths is None:
                     produced_output_paths = await _produced_output_paths(
@@ -1213,12 +1228,35 @@ async def run_agent(
                         extra_excluded_dir_names=workspace_excluded_dir_names,
                     )
                 delivery_content = _delivery_content_with_outputs(journal.get_delivery_content(), produced_output_paths)
-            receipt_persisted = await _persist_delivery_receipt(
-                event_store,
-                thread_id=thread_id,
-                run_id=run_id,
-                content=delivery_content,
+            finalization_task = asyncio.create_task(
+                _persist_journal_and_delivery_receipt(
+                    journal,
+                    event_store,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    content=delivery_content,
+                )
             )
+            finalization_task.set_name(f"deerflow-run-finalization-{run_id}")
+            run_manager.track_background_finalization(
+                finalization_task,
+                action="persist journal and delivery receipt",
+                run_id=run_id,
+            )
+            deadline = asyncio.get_running_loop().time() + _FINALIZATION_DRAIN_TIMEOUT_SECONDS
+            finalization_completed = await wait_for_task_until(finalization_task, deadline=deadline)
+            receipt_persisted = False
+            if finalization_completed and not finalization_task.cancelled():
+                try:
+                    receipt_persisted = finalization_task.result()
+                except BaseException:
+                    pass
+            elif not finalization_completed:
+                logger.warning(
+                    "Timed out after %.1f seconds waiting for ordered journal and delivery receipt finalization for run %s; it continues in the background",
+                    _FINALIZATION_DRAIN_TIMEOUT_SECONDS,
+                    run_id,
+                )
             if produced_output_paths and record.status == RunStatus.success and not receipt_persisted:
                 await run_manager.set_status(
                     run_id,
