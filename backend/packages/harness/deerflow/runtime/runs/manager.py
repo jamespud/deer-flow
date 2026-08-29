@@ -258,12 +258,10 @@ class RunManager:
         self._orphan_recovery_cancel_requested = False
         self._lock_waiters: set[asyncio.Task[bool]] = set()
         self._lock_waiter_cancel_requested: set[asyncio.Task[bool]] = set()
-        self._cancellation_cleanup_tasks: set[asyncio.Future[None]] = set()
         self._cancellation_cleanup_operations = OwnedTaskSet()
         self._cancellation_cleanup_producers: set[object] = set()
         self._cancellation_cleanup_state_changed = asyncio.Event()
         self._cancellation_cleanup_generation = 0
-        self._background_finalization_tasks: set[asyncio.Future[Any]] = set()
         self._background_finalization_operations = OwnedTaskSet()
         self._shutdown_drain_tasks: set[asyncio.Task[DrainResult]] = set()
         self._shutdown_persistence_tasks: set[asyncio.Task[bool | BaseException]] = set()
@@ -307,13 +305,11 @@ class RunManager:
         run_id: str,
     ) -> None:
         """Keep an ambiguous cancellation cleanup alive until it settles."""
-        if task in self._cancellation_cleanup_tasks:
+        if task in self._cancellation_cleanup_operations.snapshot():
             return
-        self._cancellation_cleanup_tasks.add(task)
         self._signal_cancellation_cleanup_state_change()
 
         def finalize(outcome: SettledOutcome[None]) -> None:
-            self._cancellation_cleanup_tasks.discard(outcome.future)
             self._signal_cancellation_cleanup_state_change()
             if outcome.error is None:
                 return
@@ -335,12 +331,10 @@ class RunManager:
         run_id: str,
     ) -> None:
         """Keep an ordered finalization pipeline alive until it settles."""
-        if task in self._background_finalization_tasks:
+        if task in self._background_finalization_operations.snapshot():
             return
-        self._background_finalization_tasks.add(task)
 
         def finalize(outcome: SettledOutcome[Any]) -> None:
-            self._background_finalization_tasks.discard(outcome.future)
             if outcome.error is None:
                 return
             logger.error(
@@ -2790,13 +2784,13 @@ class RunManager:
                     pending_persistence_count,
                 )
 
-        pending_cleanup_count = sum(1 for task in self._cancellation_cleanup_tasks if not task.done())
+        pending_cleanup_count = sum(1 for task in self._cancellation_cleanup_operations.snapshot() if not task.done())
         if pending_cleanup_count:
             logger.warning(
                 "Run shutdown deadline expired with %d cancellation cleanup task(s) still supervised",
                 pending_cleanup_count,
             )
-        pending_finalization_count = sum(1 for task in self._background_finalization_tasks if not task.done())
+        pending_finalization_count = sum(1 for task in self._background_finalization_operations.snapshot() if not task.done())
         if pending_finalization_count:
             logger.warning(
                 "Run shutdown deadline expired with %d background finalization task(s) still supervised",

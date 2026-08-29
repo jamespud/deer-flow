@@ -196,6 +196,8 @@ separate `OwnedTaskSet` instances. Their synchronous settlement callbacks own
 the manager-facing task metadata, late-outcome logging, and the cancellation
 cleanup state-change event; `_cancellation_cleanup_producers` closes the gap
 between a cancelled run and a callback that has not registered its cleanup yet.
+The registries are the single membership source and expose only a stable,
+read-only snapshot for manager bookkeeping.
 Shutdown drains both registries against its one absolute deadline. Manager-lock
 waiters and shutdown-status persistence retain their specialized ownership
 paths because they need lock release and durable-record fencing hooks.

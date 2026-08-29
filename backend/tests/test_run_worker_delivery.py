@@ -178,7 +178,7 @@ async def test_ordered_finalization_does_not_overtake_hung_journal_write(monkeyp
 
         assert completed is False
         assert store.receipt_attempted.is_set() is False
-        assert len(run_manager._background_finalization_tasks) == 1
+        assert len(run_manager._background_finalization_operations.snapshot()) == 1
 
         store.release_journal.set()
         assert await asyncio.wait_for(asyncio.shield(pipeline), timeout=0.2) is True
@@ -186,7 +186,7 @@ async def test_ordered_finalization_does_not_overtake_hung_journal_write(monkeyp
 
         events = await store.list_events("thread-1", "run-1")
         assert [event["event_type"] for event in events] == ["before.receipt", "run.delivery"]
-        assert not run_manager._background_finalization_tasks
+        assert not run_manager._background_finalization_operations.snapshot()
     finally:
         store.release_journal.set()
         if pipeline is not None:

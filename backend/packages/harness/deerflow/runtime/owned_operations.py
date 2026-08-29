@@ -42,24 +42,15 @@ class _OwnedOperation:
     settling: bool = False
 
 
-@dataclass(frozen=True, slots=True)
-class _CallbackBinding:
-    callback_ref: ReferenceType[object]
-
-    @classmethod
-    def from_callback(cls, callback: SettledCallback[Any]) -> _CallbackBinding:
-        return cls(callback_ref=ref(callback))
-
-    def matches(self, callback: SettledCallback[Any]) -> bool:
-        return self.callback_ref() is callback
-
-
 class OwnedTaskSet:
     """Strongly own asynchronous operations until their settlement callback runs."""
 
     def __init__(self) -> None:
         self._owned: dict[asyncio.Future[Any], _OwnedOperation] = {}
-        self._settlement_callbacks: WeakKeyDictionary[asyncio.Future[Any], _CallbackBinding] = WeakKeyDictionary()
+        self._settlement_callbacks: WeakKeyDictionary[asyncio.Future[Any], ReferenceType[object]] = WeakKeyDictionary()
+
+    def snapshot(self) -> tuple[asyncio.Future[Any], ...]:
+        return tuple(self._owned)
 
     def start(
         self,
@@ -82,11 +73,11 @@ class OwnedTaskSet:
 
         bound_callback = self._settlement_callbacks.get(future)
         if bound_callback is not None:
-            if not bound_callback.matches(on_settled):
+            if bound_callback() is not on_settled:
                 raise ValueError("future already has a different settlement callback")
             return future
 
-        self._settlement_callbacks[future] = _CallbackBinding.from_callback(on_settled)
+        self._settlement_callbacks[future] = ref(on_settled)
         self._owned[future] = _OwnedOperation(on_settled=on_settled)
         future.add_done_callback(self._settle)
         if future.done():
@@ -126,18 +117,13 @@ class OwnedTaskSet:
                 if cancellation_args is None and result.cancellation_args is not None:
                     cancellation_args = result.cancellation_args
                 if not result.completed:
-                    self._settle_completed()
-                    return DrainResult(pending=self._pending(), cancellation_args=cancellation_args)
+                    for completed in tuple(self._owned):
+                        if completed.done():
+                            self._settle(completed)
+                    pending = frozenset(owned for owned in self._owned if not owned.done())
+                    return DrainResult(pending=pending, cancellation_args=cancellation_args)
 
         return DrainResult(pending=frozenset(), cancellation_args=cancellation_args)
-
-    def _settle_completed(self) -> None:
-        for task in tuple(self._owned):
-            if task.done():
-                self._settle(task)
-
-    def _pending(self) -> frozenset[asyncio.Future[Any]]:
-        return frozenset(task for task in self._owned if not task.done())
 
     @staticmethod
     def _validate_callback(on_settled: SettledCallback[Any]) -> None:

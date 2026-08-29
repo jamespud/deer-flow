@@ -125,9 +125,6 @@ class McpTaskService:
         self._compensation_operations = OwnedTaskSet()
         self._compensation_metadata: dict[asyncio.Future[Any], tuple[str, str]] = {}
         self._compensation_settled_callback = self._settle_compensation_operation
-        self._claim_handoff_operations = OwnedTaskSet()
-        self._claim_handoff_metadata: dict[asyncio.Future[Any], tuple[str, str]] = {}
-        self._claim_handoff_settled_callback = self._settle_claim_handoff
         self._poller_operations = OwnedTaskSet()
         self._poller_settled_callback = self._settle_poller
         self._claim_owners: dict[str, _ClaimOwner] = {}
@@ -414,23 +411,6 @@ class McpTaskService:
             self._compensation_metadata[task] = (action, task_id)
         self._compensation_operations.retain(task, on_settled=self._compensation_settled_callback)
 
-    def _settle_claim_handoff(self, outcome: SettledOutcome[Any]) -> None:
-        action, task_id = self._claim_handoff_metadata.pop(outcome.future, ("unknown", "unknown"))
-        if outcome.error is None:
-            return
-        logger.error(
-            "MCP task cancellation operation failed (%s, task_id=%s): %s",
-            action,
-            task_id,
-            outcome.error,
-            exc_info=(type(outcome.error), outcome.error, outcome.error.__traceback__),
-        )
-
-    def _retain_claim_handoff(self, task: asyncio.Future[Any], *, action: str, task_id: str) -> None:
-        if task not in self._claim_handoff_metadata:
-            self._claim_handoff_metadata[task] = (action, task_id)
-        self._claim_handoff_operations.retain(task, on_settled=self._claim_handoff_settled_callback)
-
     async def _drain_cancellation_task(
         self,
         task: asyncio.Future[Any],
@@ -438,12 +418,9 @@ class McpTaskService:
         action: str,
         task_id: str,
         deadline: float,
-        operations: OwnedTaskSet | None = None,
     ) -> tuple[bool, Any]:
-        if operations is None:
-            self._retain_compensation_operation(task, action=action, task_id=task_id)
-            operations = self._compensation_operations
-        result = await operations.wait_until(task, deadline=deadline)
+        self._retain_compensation_operation(task, action=action, task_id=task_id)
+        result = await self._compensation_operations.wait_until(task, deadline=deadline)
         if not result.completed:
             logger.warning(
                 "Timed out after %.1f seconds waiting for MCP task cancellation operation; it continues in the background (%s, task_id=%s)",
@@ -658,13 +635,12 @@ class McpTaskService:
                 ),
                 name=f"mcp-{task_prefix}-cancellation-handoff",
             )
-            self._retain_claim_handoff(handoff, action=f"finish {action} batch handoff", task_id="batch")
+            self._retain_compensation_operation(handoff, action=f"finish {action} batch handoff", task_id="batch")
             await self._drain_cancellation_task(
                 handoff,
                 action=f"finish {action} batch handoff",
                 task_id="batch",
                 deadline=asyncio.get_running_loop().time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
-                operations=self._claim_handoff_operations,
             )
             # A task that was cancelled before entering this handler stores a
             # special cancelled state; raising that same exception object can
@@ -1074,7 +1050,6 @@ class McpTaskService:
                 action=f"finish {action} handoff",
                 task_id="batch",
                 deadline=loop.time() + _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
-                operations=self._claim_handoff_operations,
             )
             raise
         except Exception:
@@ -1105,7 +1080,7 @@ class McpTaskService:
                 ),
                 name=f"mcp-{action.replace(' ', '-')}-handoff",
             )
-            self._retain_claim_handoff(owner.handoff_task, action=f"finish {action} handoff", task_id="batch")
+            self._retain_compensation_operation(owner.handoff_task, action=f"finish {action} handoff", task_id="batch")
         return owner.handoff_task
 
     async def _finish_cancelled_claim_handoff(
@@ -1476,15 +1451,16 @@ class McpTaskService:
         self._stop_timeout_logged = False
         task = asyncio.create_task(self._run_loop(), name="deerflow-mcp-task-poller")
         self._task = task
-        task.add_done_callback(self._poller_done)
+        self._poller_operations.retain(task, on_settled=self._poller_settled_callback)
 
-    def _poller_done(self, task: asyncio.Task[None]) -> None:
+    def _settle_poller(self, outcome: SettledOutcome[None]) -> None:
+        task = outcome.future
         if self._task is task:
             self._task = None
             self._stopping_task = None
             self._stop_deadline = None
             self._stop_timeout_logged = False
-        error = _consume_task_error(task)
+        error = outcome.error
         if error is None or isinstance(error, asyncio.CancelledError):
             return
         logger.error(
@@ -1492,10 +1468,6 @@ class McpTaskService:
             error,
             exc_info=(type(error), error, error.__traceback__),
         )
-
-    def _settle_poller(self, _outcome: SettledOutcome[None]) -> None:
-        # _poller_done remains the MCP-local authority for poller lifecycle and logging.
-        return
 
     def _log_stop_timeout(self, task: asyncio.Task[None]) -> None:
         if self._stopping_task is not task or self._stop_timeout_logged:
@@ -1525,7 +1497,6 @@ class McpTaskService:
             self._log_stop_timeout(task)
         cancellation_args = result.cancellation_args
         for operations in (
-            self._claim_handoff_operations,
             self._compensation_operations,
             self._submission_compensations,
         ):

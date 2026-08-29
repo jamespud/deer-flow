@@ -8,6 +8,31 @@ from deerflow.runtime.owned_operations import OwnedTaskSet
 
 
 @pytest.mark.anyio
+async def test_registry_exposes_stable_read_only_collection_view():
+    release = asyncio.Event()
+    first = asyncio.create_task(release.wait())
+    second = asyncio.create_task(release.wait())
+    owned = OwnedTaskSet()
+
+    def on_settled(outcome):
+        pass
+
+    owned.retain(first, on_settled=on_settled)
+    owned.retain(second, on_settled=on_settled)
+    snapshot = owned.snapshot()
+
+    assert len(snapshot) == 2
+    assert first in snapshot
+    assert snapshot == (first, second)
+
+    release.set()
+    await owned.drain_all_until(deadline=asyncio.get_running_loop().time() + 1)
+
+    assert owned.snapshot() == ()
+    assert first not in owned.snapshot()
+
+
+@pytest.mark.anyio
 async def test_retain_reports_completed_success_with_terminal_outcome():
     loop = asyncio.get_running_loop()
     future: asyncio.Future[str] = loop.create_future()

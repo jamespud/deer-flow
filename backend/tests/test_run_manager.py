@@ -307,14 +307,14 @@ async def test_hung_finalization_fence_transfers_to_background(monkeypatch: pyte
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(caller, timeout=0.2)
-    assert len(manager._cancellation_cleanup_tasks) == 1
+    assert len(manager._cancellation_cleanup_operations.snapshot()) == 1
 
     finish_fence.set()
-    await asyncio.gather(*tuple(manager._cancellation_cleanup_tasks), return_exceptions=True)
+    await asyncio.gather(*manager._cancellation_cleanup_operations.snapshot(), return_exceptions=True)
     await asyncio.sleep(0)
     assert record.ownership_lost is True
     assert fence_calls == 1
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -356,14 +356,14 @@ async def test_hung_cancelled_admission_cleanup_transfers_to_background(monkeypa
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(caller, timeout=0.2)
-    assert len(manager._cancellation_cleanup_tasks) == 1
+    assert len(manager._cancellation_cleanup_operations.snapshot()) == 1
 
     finish_cleanup.set()
-    await asyncio.gather(*tuple(manager._cancellation_cleanup_tasks), return_exceptions=True)
+    await asyncio.gather(*manager._cancellation_cleanup_operations.snapshot(), return_exceptions=True)
     await asyncio.sleep(0)
     assert replacement.status == RunStatus.interrupted
     assert cleanup_calls == 1
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -398,13 +398,13 @@ async def test_late_cancellation_cleanup_outcome_is_consumed_without_replacing_c
 
     with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(caller, timeout=0.2)
-    assert len(manager._cancellation_cleanup_tasks) == 1
+    assert len(manager._cancellation_cleanup_operations.snapshot()) == 1
 
     finish_cleanup.set()
-    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    cleanup = manager._cancellation_cleanup_operations.snapshot()[0]
     await asyncio.gather(cleanup, return_exceptions=True)
     await asyncio.sleep(0)
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
     assert caplog.text.count(f"run_id={record.run_id}") == 1
     assert "Run cancellation cleanup" in caplog.text
 
@@ -443,13 +443,13 @@ async def test_repeated_cancellation_uses_one_cleanup_task_and_absolute_deadline
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(caller, timeout=0.2)
-    assert len(manager._cancellation_cleanup_tasks) == 1
-    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    assert len(manager._cancellation_cleanup_operations.snapshot()) == 1
+    cleanup = manager._cancellation_cleanup_operations.snapshot()[0]
     finish_cleanup.set()
     await asyncio.gather(cleanup, return_exceptions=True)
     await asyncio.sleep(0)
     assert cleanup_calls == 1
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -470,12 +470,12 @@ async def test_shutdown_observes_supervised_cleanup_only_within_budget(caplog: p
 
     assert loop.time() - started < 0.2
     assert cleanup.done() is False
-    assert cleanup in manager._cancellation_cleanup_tasks
+    assert cleanup in manager._cancellation_cleanup_operations.snapshot()
     assert "cancellation cleanup task" in caplog.text
     finish_cleanup.set()
     await cleanup
     await asyncio.sleep(0)
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -497,12 +497,12 @@ async def test_shutdown_observes_background_finalization_only_within_budget(capl
 
     assert loop.time() - started < 0.2
     assert finalization.done() is False
-    assert finalization in manager._background_finalization_tasks
+    assert finalization in manager._background_finalization_operations.snapshot()
     assert "background finalization task" in caplog.text
     finish_finalization.set()
     assert await finalization is True
     await asyncio.sleep(0)
-    assert not manager._background_finalization_tasks
+    assert not manager._background_finalization_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -529,7 +529,7 @@ async def test_shutdown_observes_cleanup_registered_by_cancelled_run_before_dead
     assert shutdown_task.done() is False
     cleanup_finished.set()
     await shutdown_task
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -557,12 +557,12 @@ async def test_shutdown_keeps_dynamic_cleanup_supervised_after_deadline(caplog: 
         await shutdown_task
 
     assert any("cancellation cleanup task" in message for message in caplog.messages)
-    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    cleanup = manager._cancellation_cleanup_operations.snapshot()[0]
     assert cleanup.done() is False
     cleanup_finished.set()
     await cleanup
     await asyncio.sleep(0)
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -605,12 +605,12 @@ async def test_shutdown_waits_for_delayed_run_completion_cleanup_registration():
     shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.05))
     await asyncio.wait_for(cleanup_registered.wait(), timeout=0.2)
     assert shutdown_task.done() is False
-    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    cleanup = manager._cancellation_cleanup_operations.snapshot()[0]
     cleanup_finished.set()
     await shutdown_task
     await asyncio.sleep(0)
     assert cleanup.done() is True
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -656,13 +656,13 @@ async def test_shutdown_keeps_delayed_stalled_cleanup_supervised_until_deadline(
         assert shutdown_task.done() is False
         await shutdown_task
 
-    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    cleanup = manager._cancellation_cleanup_operations.snapshot()[0]
     assert cleanup.done() is False
     assert any("cancellation cleanup task" in message for message in caplog.messages)
     cleanup_finished.set()
     await cleanup
     await asyncio.sleep(0)
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -688,7 +688,7 @@ async def test_shutdown_waits_for_registered_cleanup_producer_through_deep_callb
     assert shutdown_task.done() is False
     cleanup_finished.set()
     await shutdown_task
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -709,7 +709,7 @@ async def test_shutdown_waits_for_cleanup_producer_that_finishes_without_registr
     shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.2))
     await asyncio.wait_for(producer_released.wait(), timeout=0.2)
     await shutdown_task
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -748,7 +748,7 @@ async def test_shutdown_rechecks_cleanup_registered_by_finalization_callback():
             await shutdown_task
 
     await asyncio.sleep(0)
-    assert not manager._cancellation_cleanup_tasks
+    assert not manager._cancellation_cleanup_operations.snapshot()
 
 
 @pytest.mark.anyio
@@ -777,10 +777,10 @@ async def test_shutdown_propagates_cancellation_during_owned_registry_drain(regi
     owned_task = asyncio.create_task(release_owned_task.wait())
     if registry == "cleanup":
         manager._track_cancellation_cleanup(owned_task, action="test cleanup", run_id="run-1")
-        owned_tasks = manager._cancellation_cleanup_tasks
+        owned_tasks = manager._cancellation_cleanup_operations
     else:
         manager.track_background_finalization(owned_task, action="test finalization", run_id="run-1")
-        owned_tasks = manager._background_finalization_tasks
+        owned_tasks = manager._background_finalization_operations
 
     shutdown_task = asyncio.create_task(manager.shutdown(timeout=1.0))
     drain_tasks: tuple[asyncio.Task[Any], ...] = ()
@@ -796,7 +796,7 @@ async def test_shutdown_propagates_cancellation_during_owned_registry_drain(regi
         assert caught.value.args == ("caller cancellation",)
         assert asyncio.get_running_loop().time() - started < 0.2
         assert owned_task.cancelled() is False
-        assert owned_task in owned_tasks
+        assert owned_task in owned_tasks.snapshot()
         drain_tasks = tuple(manager._shutdown_drain_tasks)
         assert drain_tasks
     finally:
@@ -809,7 +809,7 @@ async def test_shutdown_propagates_cancellation_during_owned_registry_drain(regi
                 await shutdown_task
 
     await asyncio.sleep(0)
-    assert not owned_tasks
+    assert not owned_tasks.snapshot()
     assert not manager._shutdown_drain_tasks
 
 

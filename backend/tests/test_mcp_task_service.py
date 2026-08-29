@@ -18,6 +18,7 @@ from deerflow.mcp.tasks import (
 )
 from deerflow.mcp.tasks.ordinary import McpTaskProtocolError
 from deerflow.persistence.mcp_tasks import DuplicateMcpRemoteTaskError
+from deerflow.runtime.owned_operations import SettledOutcome
 from deerflow.runtime.runs.manager import ConflictError
 from deerflow.runtime.runs.schemas import RunStatus
 
@@ -1506,7 +1507,7 @@ async def test_stop_callers_share_deadline_and_log_one_timeout(monkeypatch, capl
 
 
 @pytest.mark.asyncio
-async def test_poller_done_clears_stop_state_and_ignores_stale_callback(monkeypatch, caplog):
+async def test_poller_settlement_clears_stop_state_and_ignores_stale_callback(monkeypatch, caplog):
     monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.05)
     clock = [0.0]
     wait_timeouts = []
@@ -1594,7 +1595,14 @@ async def test_poller_done_clears_stop_state_and_ignores_stale_callback(monkeypa
         assert wait_timeouts == pytest.approx([0.05, 0.05])
 
         # A callback from the completed poller must not clear the new episode.
-        service._poller_done(first_task)
+        service._settle_poller(
+            SettledOutcome(
+                future=first_task,
+                result=None,
+                error=None,
+                cancelled=False,
+            )
+        )
         assert service._task is second_task
         assert service._stopping_task is second_task
         assert service._stop_deadline == pytest.approx(10.05)
