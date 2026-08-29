@@ -142,3 +142,125 @@ PYTHONPATH=. uv run python scripts/benchmark/checkpoint/bench_production.py \
 PYTHONPATH=. uv run python scripts/benchmark/checkpoint/summarize_production.py \
   /tmp/production-bench.jsonl
 ```
+
+### Bounded Cancellation Drains
+
+Source map (paths relative to `backend/`):
+`packages/harness/deerflow/runtime/cancellation.py` provides the shared absolute-
+deadline wait primitive; `app/mcp_tasks/service.py` owns MCP claim, batch,
+release, and stop handoffs; `packages/harness/deerflow/runtime/journal.py` owns
+event-store writes; and `packages/harness/deerflow/runtime/runs/manager.py` owns
+run cancellation, finalization, and shutdown. Inner-vs-outer cancellation
+predicates remain in the MCP service.
+
+Cancellation drains and `McpTaskService.stop()` currently use the module-local
+`_CANCELLATION_DRAIN_TIMEOUT_SECONDS = 5.0` monotonic deadline (`loop.time()`);
+this constant does not define `RunManager.shutdown`. Repeated caller cancellation
+is absorbed while the same absolute deadline remains in force; cancellation never
+renews the wait. When caller-cancellation draining times out:
+the exact asyncio operation task remains retained by the subsystem-owned registry after timeout.
+The original `CancelledError` is re-raised, while
+normal `McpTaskService.stop()` and `RunManager.shutdown()` record/log the
+deadline and return as retained work continues. `RunManager.shutdown(timeout=5.0)`
+keeps a caller-provided hard total budget (the default is overrideable), computes
+one absolute deadline, and gives nested waits only the remaining time. The
+retained owner consumes the eventual success, failure, or cancellation exactly
+once; it must not blindly retry or requeue an operation whose durable outcome is
+unknown.
+
+MCP claim and per-record release waits are bounded by the same drain deadline on
+the uncancelled poll path too. Poll, cancel, and notification each keep one
+phase-level claim owner: a timed-out claim stays single-flight, later scans do
+not start another repository claim, and its handoff releases every late row
+through the phase-specific owner-plus-token fence before clearing ownership.
+Lease expiry remains crash recovery, not the normal in-process late-claim path.
+Per-record release timeouts remain owned by the compensation registry or batch
+release state while the poller proceeds.
+
+RunManager applies its caller-provided shutdown hard total budget across
+cancellation-cleanup producers, manager-lock waiters, in-flight run
+cancellation, heartbeat stop, orphan recovery, and trailing interrupted-status
+persistence. It also observes the worker's ordered journal-plus-receipt
+finalization tasks only within that same top-level deadline; unfinished tasks
+remain strongly owned and are never cancelled merely because shutdown timed
+out. Lock waiters are
+cancelled once, tracked until a late result arrives, and release the manager
+lock at most once if they acquire it after the foreground deadline. Heartbeat
+and orphan tasks keep one background owner after a timed-out stop, while late
+failures are consumed once. Shutdown preserves a run's real final outcome when
+it settles during the drain and only marks/persists `interrupted` for work that
+did not settle.
+
+RunManager registers cancellation cleanup and worker delivery finalization with
+separate `OwnedTaskSet` instances. Their synchronous settlement callbacks own
+the manager-facing task metadata, late-outcome logging, and the cancellation
+cleanup state-change event; `_cancellation_cleanup_producers` closes the gap
+between a cancelled run and a callback that has not registered its cleanup yet.
+Shutdown drains both registries against its one absolute deadline. Manager-lock
+waiters and shutdown-status persistence retain their specialized ownership
+paths because they need lock release and durable-record fencing hooks.
+Every cleanup ownership or producer transition advances a manager-local
+generation, so shutdown re-drains cleanup when a finalization callback registers
+and releases cleanup in the same scheduling turn; it exits only after observing
+an unchanged generation with both registries empty and no active producer.
+
+MCP claimed batches run under a shielded supervisor. Each record has one
+release state and sibling release tasks start concurrently, so started and
+never-started records are released exactly once. Ordinary retry release and
+cancellation release are mutually exclusive. Inner self-cancellation is
+consumed and logged at the task boundary without killing the poller; an outer
+cancellation keeps its original signal and releases the whole batch without
+duplicating child cleanup. Claim cancellation uses the same inner-vs-outer
+predicate: a self-cancelled claim is consumed only when no caller cancellation
+is pending, otherwise the caller's cancellation wins. Notification cancellation
+does not enter ordinary retry handling. The supervisor task, every child task,
+and every ordinary or cancellation release task are retrieved and their
+terminal success, failure, or cancellation is consumed exactly once. Poll,
+cancellation, and notification batch results are observed and recorded at the
+per-record boundary; unexpected child failures are logged with that record's
+task ID, and notification failures enter that record's release handling.
+Supervisor, release, and background-ownership failures receive one contextual
+log. Successful completion clears task ownership without emitting a second log.
+
+`McpTaskService.stop()` establishes one absolute `loop.time()` deadline for the
+poller cleanup. Repeated or concurrent `stop()` calls reuse that deadline and
+do not recancel the same poller. If the deadline expires, the poller remains
+supervised in the background; `start()` will not create an overlapping poller
+while that owner is still live.
+
+### Cancellation-Safe Run Journal Writes
+
+`RunJournal` transfers each detached batch to a dedicated `put_batch` task and
+shields that task from caller cancellation. Detached writes are retained by its
+`OwnedTaskSet`; the Journal callback keeps the batch metadata and decides whether
+the observed terminal outcome is a known failure worth requeueing. Ordinary
+`flush()` observes pending and detached predecessors only through the bounded drain deadline; if one stays
+ambiguous it returns with every successor still buffered, so a timeout never
+authorizes an overtaking write or retry. A later bounded flush applies the same
+rule. `flush_until_settled()` is the worker-only path: it waits for predecessor
+outcomes, lets explicit failures restore their batch, and drains restored plus
+later events in order.
+A successful write is discarded from the
+detached registry; a late explicit failure or self-cancellation prepends its
+batch exactly once. No automatic retry is launched. If the write remains
+ambiguous after its drain deadline, ownership stays with its supervised
+background task until the final result, so a JSONL `to_thread` append or
+database commit cannot be duplicated by a blind retry. If a scheduled flush is
+cancelled before its first coroutine step, its completion callback restores the
+still-unowned detached batch instead. Do not reintroduce a direct
+`except CancelledError: requeue` around event-store writes.
+Progress quiescence consumes a progress task's own cancellation, re-reads the
+current task after completion, and cancels any delayed replacement it created;
+a hung in-flight snapshot remains owned after its bounded observation and does
+not block buffered events. Cancellation checks compare the task's count before
+and after an absorbing wait, so an already-handled historical request is not
+raised as a new cancellation.
+
+The worker computes delivery content, starts one child pipeline that calls
+`flush_until_settled()` and only then writes the idempotent `run.delivery`
+receipt, and immediately registers it with `RunManager`. The worker observes
+that whole pipeline for five seconds. On timeout the exact task continues under
+manager ownership while later finalization stages proceed; the receipt cannot
+enter the event store ahead of an unresolved journal write, and produced
+artifacts treat the unconfirmed receipt as fail-closed. Shutdown observes the
+same owner only within its caller-provided absolute deadline.
