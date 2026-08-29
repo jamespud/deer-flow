@@ -123,6 +123,80 @@ async def test_delivery_event_presented_zero_without_artifact_production():
 
 
 @pytest.mark.anyio
+async def test_ordered_finalization_does_not_overtake_hung_journal_write(monkeypatch):
+    import deerflow.runtime.journal as journal_module
+    import deerflow.runtime.runs.worker as worker_module
+    from deerflow.runtime.cancellation import wait_for_task_until
+    from deerflow.runtime.journal import RunJournal
+
+    monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+    class LockedEventStore(MemoryRunEventStore):
+        def __init__(self):
+            super().__init__()
+            self.lock = asyncio.Lock()
+            self.journal_started = asyncio.Event()
+            self.release_journal = asyncio.Event()
+            self.receipt_attempted = asyncio.Event()
+
+        async def put_batch(self, events):
+            async with self.lock:
+                self.journal_started.set()
+                await self.release_journal.wait()
+                return await super().put_batch(events)
+
+        async def put_if_absent(self, **kwargs):
+            self.receipt_attempted.set()
+            async with self.lock:
+                return await super().put_if_absent(**kwargs)
+
+    store = LockedEventStore()
+    journal = RunJournal("run-1", "thread-1", store, flush_threshold=1)
+    journal._put(event_type="before.receipt", category="trace", content="first")
+    pipeline = None
+    try:
+        await asyncio.wait_for(store.journal_started.wait(), timeout=0.2)
+        pipeline = asyncio.create_task(
+            worker_module._persist_journal_and_delivery_receipt(
+                journal,
+                store,
+                thread_id="thread-1",
+                run_id="run-1",
+                content={"presented": 0, "paths": [], "by_tool": {}},
+            )
+        )
+        run_manager = RunManager()
+        run_manager.track_background_finalization(
+            pipeline,
+            action="persist journal and delivery receipt",
+            run_id="run-1",
+        )
+        completed = await wait_for_task_until(
+            pipeline,
+            deadline=asyncio.get_running_loop().time() + 0.01,
+        )
+
+        assert completed is False
+        assert store.receipt_attempted.is_set() is False
+        assert len(run_manager._background_finalization_tasks) == 1
+
+        store.release_journal.set()
+        assert await asyncio.wait_for(asyncio.shield(pipeline), timeout=0.2) is True
+        await asyncio.sleep(0)
+
+        events = await store.list_events("thread-1", "run-1")
+        assert [event["event_type"] for event in events] == ["before.receipt", "run.delivery"]
+        assert not run_manager._background_finalization_tasks
+    finally:
+        store.release_journal.set()
+        if pipeline is not None:
+            await asyncio.gather(pipeline, return_exceptions=True)
+        pending_writes = tuple(journal._pending_flush_tasks) + tuple(journal._detached_write_tasks)
+        if pending_writes:
+            await asyncio.gather(*pending_writes, return_exceptions=True)
+
+
+@pytest.mark.anyio
 async def test_changed_outputs_succeed_when_a_produced_output_is_presented(monkeypatch):
     run_manager = RunManager()
     record = await run_manager.create("thread-1")

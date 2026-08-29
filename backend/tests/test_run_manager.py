@@ -4,11 +4,13 @@ import asyncio
 import logging
 import re
 import sqlite3
+from contextlib import suppress
 from typing import Any
 
 import pytest
 from sqlalchemy.exc import DatabaseError as SQLAlchemyDatabaseError
 
+import deerflow.runtime.runs.manager as manager_module
 from deerflow.config.run_ownership_config import RunOwnershipConfig
 from deerflow.runtime import DisconnectMode, RunManager, RunStatus, ThreadOperationKind
 from deerflow.runtime.events.store.memory import MemoryRunEventStore
@@ -129,12 +131,1197 @@ class PausedLostLeaseRunStore(MemoryRunStore):
         return False
 
 
+class BlockingFinalizationRunStore(MemoryRunStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.finalization_started = asyncio.Event()
+
+    async def finalize_if_not_cancelled(self, *args, **kwargs):
+        self.finalization_started.set()
+        await asyncio.Event().wait()
+
+
+class FailingFinalizationRunStore(MemoryRunStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.finalization_failed = asyncio.Event()
+
+    async def finalize_if_not_cancelled(self, *args, **kwargs):
+        self.finalization_failed.set()
+        raise RuntimeError("finalization unavailable")
+
+
+class CancellationResistantLock:
+    def __init__(self, outcome: str = "acquired") -> None:
+        self.acquire_started = asyncio.Event()
+        self.allow_acquire = asyncio.Event()
+        self.outcome = outcome
+        self.cancel_count = 0
+        self.release_count = 0
+        self.acquired = False
+
+    async def acquire(self) -> bool:
+        self.acquire_started.set()
+        try:
+            await self.allow_acquire.wait()
+        except asyncio.CancelledError:
+            self.cancel_count += 1
+            await self.allow_acquire.wait()
+        if self.outcome == "exception":
+            raise RuntimeError("late lock waiter failure")
+        if self.outcome == "cancelled":
+            raise asyncio.CancelledError("late lock waiter cancellation")
+        self.acquired = True
+        return True
+
+    def release(self) -> None:
+        assert self.acquired
+        self.acquired = False
+        self.release_count += 1
+
+
 async def _stored_statuses(store: MemoryRunStore, *run_ids: str) -> dict[str, Any]:
     rows = {}
     for run_id in run_ids:
         row = await store.get(run_id)
         rows[run_id] = row["status"] if row else None
     return rows
+
+
+@pytest.mark.anyio
+async def test_repeated_cancellation_during_finalization_still_fences_local_run():
+    store = BlockingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+    task = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_started.wait()
+    await manager._lock.acquire()
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    manager._lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert record.ownership_lost is True
+    assert record.abort_event.is_set() is True
+    assert record.status == RunStatus.error
+
+
+@pytest.mark.anyio
+async def test_finalization_fence_failure_preserves_caller_cancellation(monkeypatch, caplog):
+    store = BlockingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+
+    async def fail_fence(*_args, **_kwargs):
+        raise RuntimeError("fence unavailable")
+
+    monkeypatch.setattr(manager, "_mark_ownership_lost", fail_fence)
+    task = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_started.wait()
+    task.cancel()
+
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert "fence unavailable" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_cancellation_during_normal_error_finalization_fence_still_fences_local_run():
+    store = FailingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+        persistence_retry_policy=PersistenceRetryPolicy(max_attempts=1, initial_delay=0),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+    await manager._lock.acquire()
+    task = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_failed.wait()
+    await asyncio.sleep(0)
+    task.cancel()
+    manager._lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert record.ownership_lost is True
+    assert record.abort_event.is_set() is True
+
+
+@pytest.mark.anyio
+async def test_hung_finalization_fence_transfers_to_background(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(manager_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    store = BlockingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+    fence_started = asyncio.Event()
+    finish_fence = asyncio.Event()
+    fence_calls = 0
+    original_mark = manager._mark_ownership_lost
+
+    async def hung_mark(*args, **kwargs):
+        nonlocal fence_calls
+        fence_calls += 1
+        fence_started.set()
+        await finish_fence.wait()
+        await original_mark(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "_mark_ownership_lost", hung_mark)
+    caller = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_started.wait()
+    caller.cancel()
+    await fence_started.wait()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, timeout=0.2)
+    assert len(manager._cancellation_cleanup_tasks) == 1
+
+    finish_fence.set()
+    await asyncio.gather(*tuple(manager._cancellation_cleanup_tasks), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert record.ownership_lost is True
+    assert fence_calls == 1
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_hung_cancelled_admission_cleanup_transfers_to_background(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(manager_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    store = MemoryRunStore()
+    manager = RunManager(store=store)
+    old = await manager.create("thread-1")
+    await manager.set_status(old.run_id, RunStatus.running)
+    old_persist_started = asyncio.Event()
+    release_old_persist = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    cleanup_calls = 0
+    original_persist = manager._persist_status
+    original_close = manager._close_cancelled_admission
+
+    async def block_old_persist(record, status, **kwargs):
+        if record.run_id == old.run_id:
+            old_persist_started.set()
+            await release_old_persist.wait()
+        return await original_persist(record, status, **kwargs)
+
+    async def hung_close(record):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        await finish_cleanup.wait()
+        await original_close(record)
+
+    monkeypatch.setattr(manager, "_persist_status", block_old_persist)
+    monkeypatch.setattr(manager, "_close_cancelled_admission", hung_close)
+    caller = asyncio.create_task(manager.create_or_reject("thread-1", multitask_strategy="interrupt"))
+    await old_persist_started.wait()
+    replacement = next(record for record in manager._runs.values() if record.run_id != old.run_id)
+    caller.cancel()
+    release_old_persist.set()
+    await cleanup_started.wait()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, timeout=0.2)
+    assert len(manager._cancellation_cleanup_tasks) == 1
+
+    finish_cleanup.set()
+    await asyncio.gather(*tuple(manager._cancellation_cleanup_tasks), return_exceptions=True)
+    await asyncio.sleep(0)
+    assert replacement.status == RunStatus.interrupted
+    assert cleanup_calls == 1
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("cleanup_error", [RuntimeError("fence unavailable"), asyncio.CancelledError()], ids=["failure", "self-cancel"])
+async def test_late_cancellation_cleanup_outcome_is_consumed_without_replacing_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cleanup_error: BaseException,
+):
+    monkeypatch.setattr(manager_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    store = BlockingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+    finish_cleanup = asyncio.Event()
+
+    async def late_cleanup(*_args, **_kwargs):
+        await finish_cleanup.wait()
+        raise cleanup_error
+
+    monkeypatch.setattr(manager, "_mark_ownership_lost", late_cleanup)
+    caller = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_started.wait()
+    caller.cancel()
+
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, timeout=0.2)
+    assert len(manager._cancellation_cleanup_tasks) == 1
+
+    finish_cleanup.set()
+    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    await asyncio.gather(cleanup, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert not manager._cancellation_cleanup_tasks
+    assert caplog.text.count(f"run_id={record.run_id}") == 1
+    assert "Run cancellation cleanup" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_repeated_cancellation_uses_one_cleanup_task_and_absolute_deadline(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(manager_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.03)
+    store = BlockingFinalizationRunStore()
+    manager = RunManager(
+        store=store,
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    record = await manager.create("thread-1")
+    await manager.set_status(record.run_id, RunStatus.running)
+    finish_cleanup = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_calls = 0
+
+    async def late_cleanup(*_args, **_kwargs):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        cleanup_started.set()
+        await finish_cleanup.wait()
+
+    monkeypatch.setattr(manager, "_mark_ownership_lost", late_cleanup)
+    caller = asyncio.create_task(manager.set_status_if_not_cancelled(record.run_id, RunStatus.success))
+    await store.finalization_started.wait()
+    caller.cancel()
+    await cleanup_started.wait()
+    await asyncio.sleep(0.005)
+    caller.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(caller, timeout=0.2)
+    assert len(manager._cancellation_cleanup_tasks) == 1
+    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    finish_cleanup.set()
+    await asyncio.gather(cleanup, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert cleanup_calls == 1
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_observes_supervised_cleanup_only_within_budget(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    finish_cleanup = asyncio.Event()
+
+    async def wait_for_cleanup() -> None:
+        await finish_cleanup.wait()
+
+    cleanup = asyncio.create_task(wait_for_cleanup())
+    manager._track_cancellation_cleanup(cleanup, action="test cleanup", run_id="run-1")
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    with caplog.at_level(logging.WARNING):
+        await manager.shutdown(timeout=0.01)
+
+    assert loop.time() - started < 0.2
+    assert cleanup.done() is False
+    assert cleanup in manager._cancellation_cleanup_tasks
+    assert "cancellation cleanup task" in caplog.text
+    finish_cleanup.set()
+    await cleanup
+    await asyncio.sleep(0)
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_observes_background_finalization_only_within_budget(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    finish_finalization = asyncio.Event()
+
+    async def wait_for_finalization() -> bool:
+        await finish_finalization.wait()
+        return True
+
+    finalization = asyncio.create_task(wait_for_finalization())
+    manager.track_background_finalization(finalization, action="test finalization", run_id="run-1")
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    with caplog.at_level(logging.WARNING):
+        await manager.shutdown(timeout=0.01)
+
+    assert loop.time() - started < 0.2
+    assert finalization.done() is False
+    assert finalization in manager._background_finalization_tasks
+    assert "background finalization task" in caplog.text
+    finish_finalization.set()
+    assert await finalization is True
+    await asyncio.sleep(0)
+    assert not manager._background_finalization_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_observes_cleanup_registered_by_cancelled_run_before_deadline():
+    manager = RunManager()
+    cleanup_finished = asyncio.Event()
+    cleanup_registered = asyncio.Event()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+
+    async def run() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(cleanup_finished.wait())
+            manager._track_cancellation_cleanup(cleanup, action="dynamic cleanup", run_id="run-1")
+            cleanup_registered.set()
+        finally:
+            release_producer()
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.2))
+    await cleanup_registered.wait()
+    assert shutdown_task.done() is False
+    cleanup_finished.set()
+    await shutdown_task
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_keeps_dynamic_cleanup_supervised_after_deadline(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    cleanup_registered = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+
+    async def run() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(cleanup_finished.wait())
+            manager._track_cancellation_cleanup(cleanup, action="stalled dynamic cleanup", run_id="run-1")
+            cleanup_registered.set()
+        finally:
+            release_producer()
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    with caplog.at_level(logging.WARNING):
+        shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.05))
+        await cleanup_registered.wait()
+        await shutdown_task
+
+    assert any("cancellation cleanup task" in message for message in caplog.messages)
+    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    assert cleanup.done() is False
+    cleanup_finished.set()
+    await cleanup
+    await asyncio.sleep(0)
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_waits_for_delayed_run_completion_cleanup_registration():
+    manager = RunManager()
+    cleanup_finished = asyncio.Event()
+    cleanup_registered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+
+    async def register_cleanup() -> None:
+        await asyncio.sleep(0)
+        cleanup = asyncio.create_task(cleanup_finished.wait())
+        manager._track_cancellation_cleanup(cleanup, action="delayed cleanup", run_id="run-1")
+        cleanup_registered.set()
+        release_producer()
+
+    async def run() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+
+    def schedule_register() -> None:
+        asyncio.create_task(register_cleanup())
+
+    def second_barrier() -> None:
+        loop.call_soon(schedule_register)
+
+    def first_barrier() -> None:
+        loop.call_soon(second_barrier)
+
+    def after_run(_completed: asyncio.Future[None]) -> None:
+        loop.call_soon(first_barrier)
+
+    record.task.add_done_callback(after_run)
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.05))
+    await asyncio.wait_for(cleanup_registered.wait(), timeout=0.2)
+    assert shutdown_task.done() is False
+    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    cleanup_finished.set()
+    await shutdown_task
+    await asyncio.sleep(0)
+    assert cleanup.done() is True
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_keeps_delayed_stalled_cleanup_supervised_until_deadline(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    cleanup_finished = asyncio.Event()
+    cleanup_registered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+
+    async def register_cleanup() -> None:
+        await asyncio.sleep(0)
+        cleanup = asyncio.create_task(cleanup_finished.wait())
+        manager._track_cancellation_cleanup(cleanup, action="delayed stalled cleanup", run_id="run-1")
+        cleanup_registered.set()
+        release_producer()
+
+    async def run() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+
+    def schedule_register() -> None:
+        asyncio.create_task(register_cleanup())
+
+    def second_barrier() -> None:
+        loop.call_soon(schedule_register)
+
+    def first_barrier() -> None:
+        loop.call_soon(second_barrier)
+
+    def after_run(_completed: asyncio.Future[None]) -> None:
+        loop.call_soon(first_barrier)
+
+    record.task.add_done_callback(after_run)
+    with caplog.at_level(logging.WARNING):
+        shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.05))
+        await asyncio.wait_for(cleanup_registered.wait(), timeout=0.2)
+        assert shutdown_task.done() is False
+        await shutdown_task
+
+    cleanup = next(iter(manager._cancellation_cleanup_tasks))
+    assert cleanup.done() is False
+    assert any("cancellation cleanup task" in message for message in caplog.messages)
+    cleanup_finished.set()
+    await cleanup
+    await asyncio.sleep(0)
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_waits_for_registered_cleanup_producer_through_deep_callback_chain():
+    manager = RunManager()
+    cleanup_finished = asyncio.Event()
+    cleanup_registered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+
+    def callback(depth: int) -> None:
+        if depth < 100:
+            loop.call_soon(callback, depth + 1)
+            return
+        cleanup = asyncio.create_task(cleanup_finished.wait())
+        manager._track_cancellation_cleanup(cleanup, action="deep delayed cleanup", run_id="run-1")
+        cleanup_registered.set()
+        release_producer()
+
+    loop.call_soon(callback, 0)
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.05))
+    await asyncio.wait_for(cleanup_registered.wait(), timeout=0.2)
+    assert shutdown_task.done() is False
+    cleanup_finished.set()
+    await shutdown_task
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_waits_for_cleanup_producer_that_finishes_without_registration():
+    manager = RunManager()
+    producer_released = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+
+    def callback(depth: int) -> None:
+        if depth < 100:
+            loop.call_soon(callback, depth + 1)
+            return
+        release_producer()
+        producer_released.set()
+
+    loop.call_soon(callback, 0)
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.2))
+    await asyncio.wait_for(producer_released.wait(), timeout=0.2)
+    await shutdown_task
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_rechecks_cleanup_registered_by_finalization_callback():
+    manager = RunManager()
+    release_finalization = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_registered = asyncio.Event()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+
+    finalization = asyncio.create_task(release_finalization.wait())
+
+    def register_cleanup(_completed: asyncio.Future[None]) -> None:
+        cleanup = asyncio.create_task(release_cleanup.wait())
+        manager._track_cancellation_cleanup(cleanup, action="late cleanup", run_id="run-1")
+        cleanup_registered.set()
+        release_producer()
+
+    finalization.add_done_callback(register_cleanup)
+    manager.track_background_finalization(finalization, action="test finalization", run_id="run-1")
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.2))
+    try:
+        await asyncio.sleep(0.01)
+        release_finalization.set()
+        await cleanup_registered.wait()
+        await asyncio.sleep(0.02)
+
+        assert shutdown_task.done() is False
+        release_cleanup.set()
+        await shutdown_task
+    finally:
+        release_finalization.set()
+        release_cleanup.set()
+        await asyncio.gather(finalization, return_exceptions=True)
+        if not shutdown_task.done():
+            await shutdown_task
+
+    await asyncio.sleep(0)
+    assert not manager._cancellation_cleanup_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_cancellation_propagates_while_waiting_for_cleanup_producer():
+    manager = RunManager()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+    manager._cancellation_cleanup_state_changed.clear()
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=1.0))
+    await asyncio.sleep(0)
+    assert shutdown_task.done() is False
+
+    shutdown_task.cancel("shutdown cancelled")
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await shutdown_task
+    assert caught.value.args == ("shutdown cancelled",)
+    assert manager._cancellation_cleanup_producers
+    release_producer()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("registry", ["cleanup", "finalization"])
+async def test_shutdown_propagates_cancellation_during_owned_registry_drain(registry: str):
+    manager = RunManager()
+    release_owned_task = asyncio.Event()
+    owned_task = asyncio.create_task(release_owned_task.wait())
+    if registry == "cleanup":
+        manager._track_cancellation_cleanup(owned_task, action="test cleanup", run_id="run-1")
+        owned_tasks = manager._cancellation_cleanup_tasks
+    else:
+        manager.track_background_finalization(owned_task, action="test finalization", run_id="run-1")
+        owned_tasks = manager._background_finalization_tasks
+
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=1.0))
+    drain_tasks: tuple[asyncio.Task[Any], ...] = ()
+    try:
+        await asyncio.sleep(0.01)
+        started = asyncio.get_running_loop().time()
+        shutdown_task.cancel("caller cancellation")
+        done, _ = await asyncio.wait({shutdown_task}, timeout=0.2)
+        assert done == {shutdown_task}
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await shutdown_task
+
+        assert caught.value.args == ("caller cancellation",)
+        assert asyncio.get_running_loop().time() - started < 0.2
+        assert owned_task.cancelled() is False
+        assert owned_task in owned_tasks
+        drain_tasks = tuple(manager._shutdown_drain_tasks)
+        assert drain_tasks
+    finally:
+        release_owned_task.set()
+        await owned_task
+        if drain_tasks:
+            await asyncio.gather(*drain_tasks)
+        if not shutdown_task.done():
+            with suppress(asyncio.CancelledError):
+                await shutdown_task
+
+    await asyncio.sleep(0)
+    assert not owned_tasks
+    assert not manager._shutdown_drain_tasks
+
+
+@pytest.mark.anyio
+async def test_shutdown_bounds_initial_manager_lock_wait(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    await manager._lock.acquire()
+    started = asyncio.get_running_loop().time()
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(manager.shutdown(timeout=0.01), timeout=0.2)
+    finally:
+        manager._lock.release()
+
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert "could not acquire manager lock" in caplog.text
+    await asyncio.wait_for(manager._lock.acquire(), timeout=0.1)
+    manager._lock.release()
+    await asyncio.sleep(0)
+    assert not getattr(manager._lock, "_waiters", ())
+
+
+@pytest.mark.anyio
+async def test_lock_waiter_settlement_has_absolute_deadline_and_tracks_late_acquire():
+    manager = RunManager()
+    lock = CancellationResistantLock()
+    manager._lock = lock
+    loop = asyncio.get_running_loop()
+
+    waiter_task = asyncio.create_task(manager._acquire_lock_until(loop.time() + 0.02))
+    await lock.acquire_started.wait()
+    started = loop.time()
+
+    result = await asyncio.wait_for(asyncio.shield(waiter_task), timeout=0.2)
+
+    assert result is False
+    assert loop.time() - started < 0.1
+    assert lock.cancel_count == 1
+    assert len(manager._lock_waiters) == 1
+
+    lock.allow_acquire.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert lock.release_count == 1
+    assert not manager._lock_waiters
+
+
+@pytest.mark.anyio
+async def test_repeated_lock_waiter_cancellation_preserves_original_signal_and_deadline():
+    manager = RunManager()
+    lock = CancellationResistantLock()
+    manager._lock = lock
+    loop = asyncio.get_running_loop()
+    waiter_task = asyncio.create_task(manager._acquire_lock_until(loop.time() + 0.03))
+    await lock.acquire_started.wait()
+
+    started = loop.time()
+    waiter_task.cancel("first cancellation")
+    await asyncio.sleep(0)
+    waiter_task.cancel("second cancellation")
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await asyncio.wait_for(waiter_task, timeout=0.2)
+
+    assert caught.value.args == ("first cancellation",)
+    assert loop.time() - started < 0.1
+    assert lock.cancel_count == 1
+    assert len(manager._lock_waiters) == 1
+
+    lock.allow_acquire.set()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert lock.release_count == 1
+    assert not manager._lock_waiters
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("outcome", ["exception", "cancelled"])
+async def test_late_lock_waiter_outcome_is_observed_once(outcome, caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    lock = CancellationResistantLock(outcome)
+    manager._lock = lock
+    loop = asyncio.get_running_loop()
+
+    with caplog.at_level(logging.WARNING):
+        result = await manager._acquire_lock_until(loop.time() + 0.02)
+
+    assert result is False
+    assert len(manager._lock_waiters) == 1
+    waiter = next(iter(manager._lock_waiters))
+    lock.allow_acquire.set()
+    if outcome == "exception":
+        with pytest.raises(RuntimeError, match="late lock waiter failure"):
+            await asyncio.wait_for(asyncio.shield(waiter), timeout=0.2)
+    else:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(waiter), timeout=0.2)
+    await asyncio.sleep(0)
+
+    assert not manager._lock_waiters
+    assert "Manager lock waiter" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_lock_waiter_same_tick_timeout_releases_at_most_once(monkeypatch: pytest.MonkeyPatch):
+    manager = RunManager()
+    lock = CancellationResistantLock()
+    manager._lock = lock
+
+    async def settle(_waiter, *, deadline):
+        _waiter.cancel()
+        lock.allow_acquire.set()
+        lock.acquired = True
+        return True
+
+    monkeypatch.setattr(manager, "_cancel_and_settle_lock_waiter", settle)
+    result = await manager._acquire_lock_until(asyncio.get_running_loop().time() - 1)
+
+    assert result is False
+    assert lock.release_count == 0
+
+    # Exercise the timeout branch with an already-expired deadline while the
+    # waiter is still pending in a controlled same-tick race.
+    result = await manager._acquire_lock_until(asyncio.get_running_loop().time() + 0.001)
+    assert result is False
+    assert lock.release_count == 1
+    assert lock.acquired is False
+
+
+@pytest.mark.anyio
+async def test_shutdown_bounds_post_wait_manager_lock_wait(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    run_started = asyncio.Event()
+    lock_held = asyncio.Event()
+    release_lock = asyncio.Event()
+
+    async def run() -> None:
+        run_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await manager._lock.acquire()
+            lock_held.set()
+            await release_lock.wait()
+            manager._lock.release()
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    await run_started.wait()
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.03))
+
+    try:
+        await asyncio.wait_for(lock_held.wait(), timeout=0.2)
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(shutdown_task, timeout=0.2)
+    finally:
+        release_lock.set()
+        await record.task
+
+    assert "could not acquire manager lock" in caplog.text
+    await asyncio.wait_for(manager._lock.acquire(), timeout=0.1)
+    manager._lock.release()
+    assert not getattr(manager._lock, "_waiters", ())
+
+
+@pytest.mark.anyio
+async def test_shutdown_observes_completed_run_after_post_wait_lock_timeout():
+    store = MemoryRunStore()
+    manager = RunManager(store=store)
+    run_started = asyncio.Event()
+    holder_started = asyncio.Event()
+    release_holder = asyncio.Event()
+    holder_task: asyncio.Task[None] | None = None
+
+    async def hold_lock() -> None:
+        await manager._lock.acquire()
+        holder_started.set()
+        await release_holder.wait()
+        manager._lock.release()
+
+    async def run() -> None:
+        nonlocal holder_task
+        run_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            holder_task = asyncio.create_task(hold_lock())
+            await holder_started.wait()
+            raise RuntimeError("run failed during shutdown")
+
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    await run_started.wait()
+
+    try:
+        await asyncio.wait_for(manager.shutdown(timeout=0.03), timeout=0.2)
+        assert record.task.done()
+        assert getattr(record.task, "_log_traceback", True) is False
+        assert record.status == RunStatus.pending
+        stored = await store.get(record.run_id)
+        assert stored is not None
+        assert stored["status"] == RunStatus.pending.value
+    finally:
+        release_holder.set()
+        if holder_task is not None:
+            await holder_task
+
+
+@pytest.mark.anyio
+async def test_shutdown_cancellation_observes_completed_run_during_post_wait_lock():
+    store = MemoryRunStore()
+    manager = RunManager(store=store)
+    run_started = asyncio.Event()
+    holder_started = asyncio.Event()
+    release_holder = asyncio.Event()
+    second_lock_wait_started = asyncio.Event()
+    holder_task: asyncio.Task[None] | None = None
+    acquire_calls = 0
+    original_acquire = manager._acquire_lock_until
+
+    async def observe_second_lock_wait(deadline: float) -> bool:
+        nonlocal acquire_calls
+        acquire_calls += 1
+        if acquire_calls == 2:
+            second_lock_wait_started.set()
+        return await original_acquire(deadline)
+
+    async def hold_lock() -> None:
+        await manager._lock.acquire()
+        holder_started.set()
+        await release_holder.wait()
+        manager._lock.release()
+
+    async def run() -> None:
+        nonlocal holder_task
+        run_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            holder_task = asyncio.create_task(hold_lock())
+            await holder_started.wait()
+            raise RuntimeError("run failed during shutdown cancellation")
+
+    manager._acquire_lock_until = observe_second_lock_wait
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    await run_started.wait()
+    shutdown_task = asyncio.create_task(manager.shutdown(timeout=1.0))
+
+    try:
+        await asyncio.wait_for(second_lock_wait_started.wait(), timeout=0.2)
+        shutdown_task.cancel("caller cancelled shutdown")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await shutdown_task
+        assert caught.value.args == ("caller cancelled shutdown",)
+        assert record.task.done()
+        assert getattr(record.task, "_log_traceback", True) is False
+        assert record.status == RunStatus.pending
+        stored = await store.get(record.run_id)
+        assert stored is not None
+        assert stored["status"] == RunStatus.pending.value
+    finally:
+        release_holder.set()
+        if holder_task is not None:
+            await holder_task
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("late_failure", [False, True], ids=["success", "failure"])
+async def test_shutdown_supervises_late_status_persistence_without_cancelling_or_retrying(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    late_failure: bool,
+):
+    manager = RunManager(store=MemoryRunStore())
+    run_started = asyncio.Event()
+    release_persist = asyncio.Event()
+    persist_started = asyncio.Event()
+    persist_calls = 0
+
+    async def run() -> None:
+        run_started.set()
+        await asyncio.Event().wait()
+
+    async def stubborn_persist(_record: Any, _status: RunStatus, **_kwargs: Any) -> bool:
+        nonlocal persist_calls
+        persist_calls += 1
+        persist_started.set()
+        try:
+            await release_persist.wait()
+        except asyncio.CancelledError:
+            raise AssertionError("shutdown must not cancel status persistence")
+        if late_failure:
+            raise RuntimeError("late shutdown persistence failed")
+        return True
+
+    monkeypatch.setattr(manager, "_persist_status", stubborn_persist)
+    record = await manager.create("thread-1")
+    record.task = asyncio.create_task(run())
+    await run_started.wait()
+
+    with caplog.at_level(logging.WARNING):
+        shutdown_task = asyncio.create_task(manager.shutdown(timeout=0.03))
+        await asyncio.wait_for(persist_started.wait(), timeout=0.2)
+        persistence_task = next(iter(manager._shutdown_persistence_tasks))
+        await asyncio.wait_for(shutdown_task, timeout=0.15)
+
+        assert persistence_task.done() is False
+        assert persistence_task in manager._shutdown_persistence_tasks
+        assert persist_calls == 1
+        release_persist.set()
+        await persistence_task
+        await asyncio.sleep(0)
+
+    assert not manager._shutdown_persistence_tasks
+    assert persist_calls == 1
+    if late_failure:
+        assert caplog.text.count("late shutdown persistence failed") == 1
+
+
+@pytest.mark.anyio
+async def test_heartbeat_does_not_schedule_orphans_after_stop_during_renewal(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    manager = RunManager(
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=5,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    renewal_started = asyncio.Event()
+    renewal_cancelled = asyncio.Event()
+    release_renewal = asyncio.Event()
+    renewal_calls = 0
+    scheduled_orphans: list[None] = []
+    real_asyncio = manager_module.asyncio
+
+    class FastAsyncio:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real_asyncio, name)
+
+        async def wait_for(self, awaitable: Any, timeout: float) -> Any:
+            if timeout == 1:
+                awaitable.close()
+                raise TimeoutError
+            return await real_asyncio.wait_for(awaitable, timeout)
+
+    async def renew_leases() -> None:
+        nonlocal renewal_calls
+        renewal_calls += 1
+        if renewal_calls != 3:
+            return
+        renewal_started.set()
+        try:
+            await release_renewal.wait()
+        except asyncio.CancelledError:
+            renewal_cancelled.set()
+            await release_renewal.wait()
+
+    monkeypatch.setattr(manager_module, "asyncio", FastAsyncio())
+    monkeypatch.setattr(manager, "_renew_leases", renew_leases)
+    monkeypatch.setattr(
+        manager,
+        "_schedule_orphan_reconciliation",
+        lambda: scheduled_orphans.append(None),
+    )
+
+    await manager.start_heartbeat()
+    task = manager._heartbeat_task
+    assert task is not None
+    await renewal_started.wait()
+
+    await manager.stop_heartbeat(timeout=0.01)
+    await asyncio.wait_for(renewal_cancelled.wait(), timeout=0.2)
+    release_renewal.set()
+    await task
+    await asyncio.sleep(0)
+
+    assert renewal_calls == 3
+    assert scheduled_orphans == []
+
+
+@pytest.mark.anyio
+async def test_stop_heartbeat_stubborn_task_keeps_one_background_owner_after_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+):
+    manager = RunManager(
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+    heartbeat_started = asyncio.Event()
+    heartbeat_cancelled = asyncio.Event()
+    finish_heartbeat = asyncio.Event()
+    cancel_calls = 0
+
+    async def stubborn_heartbeat() -> None:
+        nonlocal cancel_calls
+        heartbeat_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancel_calls += 1
+            heartbeat_cancelled.set()
+            await finish_heartbeat.wait()
+            raise RuntimeError("late heartbeat failure")
+
+    monkeypatch.setattr(manager, "_heartbeat_loop", stubborn_heartbeat)
+    await manager.start_heartbeat()
+    task = manager._heartbeat_task
+    assert task is not None
+    await heartbeat_started.wait()
+    started = asyncio.get_running_loop().time()
+
+    with caplog.at_level(logging.WARNING):
+        await manager.stop_heartbeat(timeout=0.01)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 0.2
+    await asyncio.wait_for(heartbeat_cancelled.wait(), timeout=0.2)
+    assert heartbeat_cancelled.is_set()
+    assert cancel_calls == 1
+    assert manager._heartbeat_task is task
+    assert "background" in caplog.text
+
+    started = asyncio.get_running_loop().time()
+    await manager.stop_heartbeat(timeout=0.01)
+    assert asyncio.get_running_loop().time() - started < 0.05
+    assert cancel_calls == 1
+
+    finish_heartbeat.set()
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert manager._heartbeat_task is None
+    assert "late heartbeat failure" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_orphan_recovery_stubborn_task_keeps_one_background_owner_after_deadline(caplog: pytest.LogCaptureFixture):
+    manager = RunManager()
+    recovery_started = asyncio.Event()
+    recovery_cancelled = asyncio.Event()
+    finish_recovery = asyncio.Event()
+    cancel_calls = 0
+
+    async def stubborn_recovery() -> None:
+        nonlocal cancel_calls
+        recovery_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancel_calls += 1
+            recovery_cancelled.set()
+            await finish_recovery.wait()
+            raise RuntimeError("late orphan recovery failure")
+
+    task = asyncio.create_task(stubborn_recovery())
+    manager._orphan_recovery_task = task
+    task.add_done_callback(manager._orphan_reconciliation_done)
+    await recovery_started.wait()
+    started = asyncio.get_running_loop().time()
+
+    with caplog.at_level(logging.WARNING):
+        await manager._drain_orphan_recovery_task(timeout=0.01)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert elapsed < 0.2
+    await asyncio.wait_for(recovery_cancelled.wait(), timeout=0.2)
+    assert recovery_cancelled.is_set()
+    assert cancel_calls == 1
+    assert manager._orphan_recovery_task is task
+    assert "background" in caplog.text
+
+    started = asyncio.get_running_loop().time()
+    await manager._drain_orphan_recovery_task(timeout=0.01)
+    assert asyncio.get_running_loop().time() - started < 0.05
+    assert cancel_calls == 1
+
+    finish_recovery.set()
+    await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert manager._orphan_recovery_task is None
+    assert "late orphan recovery failure" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_stop_heartbeat_consumes_completed_failure_once(caplog: pytest.LogCaptureFixture):
+    manager = RunManager(
+        run_ownership_config=RunOwnershipConfig(
+            lease_seconds=30,
+            grace_seconds=10,
+            heartbeat_enabled=True,
+        ),
+    )
+
+    async def failed_heartbeat() -> None:
+        raise RuntimeError("heartbeat failure")
+
+    manager._heartbeat_loop = failed_heartbeat
+    await manager.start_heartbeat()
+    await asyncio.sleep(0)
+
+    with caplog.at_level(logging.WARNING):
+        await manager.stop_heartbeat(timeout=0)
+        await asyncio.sleep(0)
+
+    assert caplog.messages.count("Run lease heartbeat failed; its task has stopped") == 1
+    assert manager._heartbeat_task is None
 
 
 @pytest.mark.anyio
