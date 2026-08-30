@@ -254,9 +254,10 @@ receipt, and immediately registers it with `RunManager`. The worker observes
 that whole pipeline for five seconds. On timeout the exact task continues under
 manager ownership while later finalization stages proceed; the receipt cannot
 enter the event store ahead of an unresolved journal write. Produced artifacts
-are downgraded only when receipt persistence is confirmed to have failed;
-timeout or exceptional ambiguity leaves the worker's real success outcome
-intact while the retained task finishes. If a timed-out task later confirms a
+are downgraded only when ordered finalization is confirmed to have failed;
+timeout leaves the worker's real success outcome intact while the retained task
+finishes, but a completed finalization exception is a known failure and
+downgrades the produced-output run. If a timed-out task later confirms a
 receipt failure, a success-to-error correction is applied through the narrow
 `RunManager.mark_delivery_receipt_failed` success-guarded store operation;
 another terminal outcome is never overwritten. Shutdown observes the same

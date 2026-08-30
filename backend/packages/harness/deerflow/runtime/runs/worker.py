@@ -1258,6 +1258,27 @@ async def run_agent(
             finalization_outcome_released = asyncio.Event()
             finalization_timed_out = False
 
+            async def _reconcile_known_failure_if_late() -> None:
+                await finalization_outcome_released.wait()
+                if finalization_timed_out:
+                    await terminal_status_settled.wait()
+                    await _reconcile_late_delivery_failure(
+                        run_manager,
+                        record,
+                        run_id=run_id,
+                        produced_output_paths=produced_output_paths,
+                    )
+
+            def _publish_finalization_exception(exc: BaseException) -> None:
+                finalization_result.set_exception(exc)
+                # The worker may already have timed out and stopped awaiting
+                # this outcome. Mark the exception retrieved so the supervised
+                # task remains the sole failure reporter.
+                try:
+                    finalization_result.exception()
+                except BaseException:
+                    pass
+
             async def persist_finalization() -> bool:
                 try:
                     result = await _persist_journal_and_delivery_receipt(
@@ -1267,15 +1288,16 @@ async def run_agent(
                         run_id=run_id,
                         content=delivery_content,
                     )
+                except asyncio.CancelledError as exc:
+                    _publish_finalization_exception(exc)
+                    await _reconcile_known_failure_if_late()
+                    raise
+                except Exception as exc:
+                    _publish_finalization_exception(exc)
+                    await _reconcile_known_failure_if_late()
+                    raise
                 except BaseException as exc:
-                    finalization_result.set_exception(exc)
-                    # The worker may already have timed out and stopped
-                    # awaiting this outcome. Mark the exception retrieved so
-                    # the supervised task remains the sole failure reporter.
-                    try:
-                        finalization_result.exception()
-                    except BaseException:
-                        pass
+                    _publish_finalization_exception(exc)
                     raise
                 finalization_result.set_result(result)
                 if result is False:
@@ -1283,15 +1305,7 @@ async def run_agent(
                     # The worker releases the gate after classifying the
                     # result, so a fast failure cannot be mistaken for a late
                     # one and shutdown cannot miss a newly-created task.
-                    await finalization_outcome_released.wait()
-                    if finalization_timed_out:
-                        await terminal_status_settled.wait()
-                        await _reconcile_late_delivery_failure(
-                            run_manager,
-                            record,
-                            run_id=run_id,
-                            produced_output_paths=produced_output_paths,
-                        )
+                    await _reconcile_known_failure_if_late()
                 return result
 
             finalization_task = asyncio.create_task(persist_finalization())
@@ -1308,8 +1322,10 @@ async def run_agent(
                 finalization_outcome_released.set()
                 try:
                     receipt_persisted = finalization_result.result()
-                except BaseException:
-                    pass
+                except asyncio.CancelledError:
+                    receipt_persisted = False
+                except Exception:
+                    receipt_persisted = False
             elif not finalization_completed:
                 finalization_timed_out = True
                 finalization_outcome_released.set()

@@ -810,6 +810,125 @@ async def test_finalization_timeout_does_not_downgrade_success_before_late_recei
 
 
 @pytest.mark.anyio
+async def test_completed_finalization_exception_downgrades_produced_output(monkeypatch):
+    import deerflow.runtime.runs.worker as worker_module
+
+    run_manager = RunManager()
+    record = await run_manager.create("thread-1")
+    store = MemoryRunEventStore()
+
+    monkeypatch.setattr(worker_module, "capture_workspace_snapshot", AsyncMock(return_value=WorkspaceSnapshot()))
+    monkeypatch.setattr(worker_module, "record_workspace_changes", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        worker_module,
+        "_produced_output_paths",
+        AsyncMock(return_value=["/mnt/user-data/outputs/report.md"]),
+    )
+
+    async def failing_finalization(*args, **kwargs):
+        raise RuntimeError("ordered finalization failed")
+
+    monkeypatch.setattr(worker_module, "_persist_journal_and_delivery_receipt", failing_finalization)
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            journal = config["context"]["__run_journal"]
+            journal._remember_current_run_tool_calls(
+                AIMessage(content="", tool_calls=[{"id": "call_1", "name": "present_files", "args": {}}]),
+                caller="lead_agent",
+            )
+            journal.on_tool_end(
+                Command(
+                    update={
+                        "artifacts": ["/mnt/user-data/outputs/report.md"],
+                        "messages": [ToolMessage("Successfully presented files", tool_call_id="call_1")],
+                    }
+                ),
+                run_id=uuid4(),
+            )
+            yield {"messages": []}
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=store),
+        agent_factory=lambda *, config: DummyAgent(),
+        graph_input={},
+        config={},
+    )
+
+    assert record.status == RunStatus.error
+    assert record.error == "Artifact delivery verification failed: terminal delivery receipt could not be persisted"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", [RuntimeError("ordered finalization failed late"), asyncio.CancelledError()])
+async def test_late_finalization_exception_reconciles_produced_output(monkeypatch, failure):
+    import deerflow.runtime.runs.worker as worker_module
+
+    run_store = MemoryRunStore()
+    run_manager = RunManager(store=run_store)
+    record = await run_manager.create("thread-1")
+    event_store = MemoryRunEventStore()
+    finalization_finished = asyncio.Event()
+
+    monkeypatch.setattr(worker_module, "_FINALIZATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(worker_module, "capture_workspace_snapshot", AsyncMock(return_value=WorkspaceSnapshot()))
+    monkeypatch.setattr(worker_module, "record_workspace_changes", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        worker_module,
+        "_produced_output_paths",
+        AsyncMock(return_value=["/mnt/user-data/outputs/report.md"]),
+    )
+
+    async def late_failing_finalization(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        finalization_finished.set()
+        raise failure
+
+    monkeypatch.setattr(worker_module, "_persist_journal_and_delivery_receipt", late_failing_finalization)
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            journal = config["context"]["__run_journal"]
+            journal._remember_current_run_tool_calls(
+                AIMessage(content="", tool_calls=[{"id": "call_1", "name": "present_files", "args": {}}]),
+                caller="lead_agent",
+            )
+            journal.on_tool_end(
+                Command(
+                    update={
+                        "artifacts": ["/mnt/user-data/outputs/report.md"],
+                        "messages": [ToolMessage("Successfully presented files", tool_call_id="call_1")],
+                    }
+                ),
+                run_id=uuid4(),
+            )
+            yield {"messages": []}
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=event_store),
+        agent_factory=lambda *, config: DummyAgent(),
+        graph_input={},
+        config={},
+    )
+
+    await asyncio.wait_for(finalization_finished.wait(), timeout=0.3)
+    async with asyncio.timeout(0.3):
+        while run_manager._background_finalization_tasks:
+            await asyncio.sleep(0)
+
+    persisted = await run_store.get(record.run_id)
+    assert persisted is not None
+    assert persisted["status"] == RunStatus.error.value
+    assert persisted["error"] == "Artifact delivery verification failed: terminal delivery receipt could not be persisted"
+
+
+@pytest.mark.anyio
 async def test_late_finalization_failure_corrects_success_after_timeout(monkeypatch):
     import deerflow.runtime.runs.worker as worker_module
 
