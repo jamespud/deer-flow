@@ -150,6 +150,16 @@ class FailingFinalizationRunStore(MemoryRunStore):
         raise RuntimeError("finalization unavailable")
 
 
+class PeerWinsDeliveryFailureStore(MemoryRunStore):
+    """Store that wins a terminal race before reporting a late receipt failure."""
+
+    async def mark_delivery_receipt_failed(self, run_id: str, *, error: str) -> bool:
+        run = self._runs[run_id]
+        run["status"] = "error"
+        run["error"] = "peer takeover"
+        return False
+
+
 class CancellationResistantLock:
     def __init__(self, outcome: str = "acquired") -> None:
         self.acquire_started = asyncio.Event()
@@ -1552,6 +1562,27 @@ async def test_fail_start_if_pending_marks_pending_run_error_and_persists():
     assert stored_running is not None
     assert stored_running["status"] == RunStatus.running.value
     assert stored_running["error"] is None
+
+
+@pytest.mark.anyio
+async def test_late_delivery_failure_does_not_overwrite_peer_terminal_status():
+    store = PeerWinsDeliveryFailureStore()
+    manager = RunManager(store=store)
+    record = await manager.create("thread-1")
+    record.status = RunStatus.success
+    await store.put(record.run_id, thread_id=record.thread_id, status="success")
+
+    corrected = await manager.mark_delivery_receipt_failed(
+        record.run_id,
+        error="receipt missing",
+    )
+
+    assert corrected is False
+    assert record.status is RunStatus.success
+    persisted = await store.get(record.run_id)
+    assert persisted is not None
+    assert persisted["status"] == "error"
+    assert persisted["error"] == "peer takeover"
 
 
 @pytest.mark.anyio

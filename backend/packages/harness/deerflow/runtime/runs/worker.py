@@ -196,6 +196,31 @@ async def _persist_journal_and_delivery_receipt(
     )
 
 
+async def _reconcile_late_delivery_failure(
+    run_manager: RunManager,
+    record: RunRecord,
+    *,
+    run_id: str,
+    produced_output_paths: list[str],
+) -> None:
+    """Apply a confirmed late receipt failure after the worker drain deadline."""
+    logger.error(
+        "Ordered journal and delivery receipt finalization failed after the drain deadline for run %s",
+        run_id,
+    )
+    if not produced_output_paths or record.ownership_lost or record.status != RunStatus.success:
+        return
+    corrected = await run_manager.mark_delivery_receipt_failed(
+        run_id,
+        error=_DELIVERY_RECEIPT_FAILED_ERROR,
+    )
+    if not corrected:
+        logger.warning(
+            "Late delivery receipt failure could not change run %s because another terminal outcome won",
+            run_id,
+        )
+
+
 _DELIVERY_INCOMPLETE_ERROR = "Artifact delivery incomplete: no produced output artifact was presented"
 _DELIVERY_RECEIPT_FAILED_ERROR = "Artifact delivery verification failed: terminal delivery receipt could not be persisted"
 
@@ -1252,6 +1277,30 @@ async def run_agent(
                 except BaseException:
                     pass
             elif not finalization_completed:
+
+                def reconcile_late_result(completed: asyncio.Future[bool]) -> None:
+                    try:
+                        late_receipt_persisted = completed.result()
+                    except BaseException:
+                        return
+                    if late_receipt_persisted is not False:
+                        return
+                    reconciliation = asyncio.create_task(
+                        _reconcile_late_delivery_failure(
+                            run_manager,
+                            record,
+                            run_id=run_id,
+                            produced_output_paths=produced_output_paths,
+                        ),
+                        name=f"deerflow-run-late-delivery-failure-{run_id}",
+                    )
+                    run_manager.track_background_finalization(
+                        reconciliation,
+                        action="persist late delivery receipt failure status",
+                        run_id=run_id,
+                    )
+
+                finalization_task.add_done_callback(reconcile_late_result)
                 logger.warning(
                     "Timed out after %.1f seconds waiting for ordered journal and delivery receipt finalization for run %s; it continues in the background",
                     _FINALIZATION_DRAIN_TIMEOUT_SECONDS,

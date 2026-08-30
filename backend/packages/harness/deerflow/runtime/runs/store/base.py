@@ -140,6 +140,16 @@ class RunStore(abc.ABC):
         """
         pass
 
+    async def mark_delivery_receipt_failed(self, run_id: str, *, error: str) -> bool:
+        """Atomically mark a successful run failed when its delivery receipt is missing.
+
+        This narrow correction is used only when a retained finalization task
+        later proves receipt persistence failed. It must not overwrite another
+        terminal outcome that won a concurrent cancellation or recovery race.
+        Legacy stores that do not support this transition report ``False``.
+        """
+        return False
+
     @abc.abstractmethod
     async def start_run(self, run_id: str) -> bool:
         """Atomically transition a pending run to running.

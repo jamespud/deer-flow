@@ -1301,6 +1301,42 @@ class RunManager:
             )
         return persisted
 
+    async def mark_delivery_receipt_failed(self, run_id: str, *, error: str) -> bool:
+        """Correct a success after retained finalization confirms receipt failure."""
+        if self._store is None:
+            async with self._lock:
+                record = self._runs.get(run_id)
+                if record is None or record.ownership_lost or record.status != RunStatus.success:
+                    return False
+                record.status = RunStatus.error
+                record.error = error
+                record.updated_at = _now_iso()
+            return True
+
+        try:
+            persisted = await self._call_store_with_retry(
+                "mark_delivery_receipt_failed",
+                run_id,
+                lambda: self._store.mark_delivery_receipt_failed(run_id, error=error),
+            )
+        except Exception:
+            logger.warning("Failed to persist late delivery receipt failure for run %s", run_id, exc_info=True)
+            return False
+        if not persisted:
+            logger.warning(
+                "Skipped late delivery receipt failure for run %s because its durable terminal status already won",
+                run_id,
+            )
+            return False
+
+        async with self._lock:
+            record = self._runs.get(run_id)
+            if record is not None and not record.ownership_lost and record.status == RunStatus.success:
+                record.status = RunStatus.error
+                record.error = error
+                record.updated_at = _now_iso()
+        return True
+
     async def set_status_if_not_cancelled(
         self,
         run_id: str,

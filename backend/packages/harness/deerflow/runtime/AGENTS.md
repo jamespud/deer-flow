@@ -256,5 +256,8 @@ manager ownership while later finalization stages proceed; the receipt cannot
 enter the event store ahead of an unresolved journal write. Produced artifacts
 are downgraded only when receipt persistence is confirmed to have failed;
 timeout or exceptional ambiguity leaves the worker's real success outcome
-intact while the retained task finishes. Shutdown observes the same owner only
-within its caller-provided absolute deadline.
+intact while the retained task finishes. If a timed-out task later confirms a
+receipt failure, a success-to-error correction is applied through the narrow
+`RunManager.mark_delivery_receipt_failed` success-guarded store operation;
+another terminal outcome is never overwritten. Shutdown observes the same
+owner only within its caller-provided absolute deadline.
