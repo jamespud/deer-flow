@@ -1,7 +1,7 @@
 """fence MCP task claims by per-claim lease tokens.
 
-Revision ID: 0017_mcp_task_lease_tokens
-Revises: 0016_subagent_batches
+Revision ID: 0018_mcp_task_lease_tokens
+Revises: 0017_personal_access_tokens
 Create Date: 2026-08-27
 """
 
@@ -11,8 +11,8 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 
-revision: str = "0017_mcp_task_lease_tokens"
-down_revision: str | Sequence[str] | None = "0016_subagent_batches"
+revision: str = "0018_mcp_task_lease_tokens"
+down_revision: str | Sequence[str] | None = "0017_personal_access_tokens"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
