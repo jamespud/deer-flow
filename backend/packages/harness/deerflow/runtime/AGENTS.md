@@ -177,6 +177,9 @@ the uncancelled poll path too. Poll, cancel, and notification each keep one
 phase-level claim owner: a timed-out claim stays single-flight, later scans do
 not start another repository claim, and its handoff releases every late row
 through the phase-specific owner-plus-token fence before clearing ownership.
+While that owner or handoff remains unresolved, subsequent scans emit a warning
+when they skip the phase, making a prolonged availability stall observable
+without overlapping an ambiguous database claim.
 Lease expiry remains crash recovery, not the normal in-process late-claim path.
 Per-record release timeouts remain owned by the compensation registry or batch
 release state while the poller proceeds.
@@ -250,6 +253,8 @@ The worker computes delivery content, starts one child pipeline that calls
 receipt, and immediately registers it with `RunManager`. The worker observes
 that whole pipeline for five seconds. On timeout the exact task continues under
 manager ownership while later finalization stages proceed; the receipt cannot
-enter the event store ahead of an unresolved journal write, and produced
-artifacts treat the unconfirmed receipt as fail-closed. Shutdown observes the
-same owner only within its caller-provided absolute deadline.
+enter the event store ahead of an unresolved journal write. Produced artifacts
+are downgraded only when receipt persistence is confirmed to have failed;
+timeout or exceptional ambiguity leaves the worker's real success outcome
+intact while the retained task finishes. Shutdown observes the same owner only
+within its caller-provided absolute deadline.

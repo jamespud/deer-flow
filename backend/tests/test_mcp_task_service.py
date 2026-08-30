@@ -2691,6 +2691,33 @@ async def test_single_flight_claim_releases_late_uncancelled_claim(phase, monkey
 
 
 @pytest.mark.asyncio
+async def test_single_flight_claim_skip_logs_unresolved_owner(caplog):
+    service = McpTaskService(
+        repository=SimpleNamespace(),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+    claim_task = asyncio.get_running_loop().create_future()
+    service._claim_owners["poll"] = service_module._ClaimOwner(claim_task=claim_task)
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            result = await service._claim_with_cancellation_release(
+                lambda: pytest.fail("an unresolved owner must suppress a new claim"),
+                phase="poll",
+                action="poll claim",
+                release=AsyncMock(),
+            )
+
+        assert result == []
+        assert "previous claim/handoff is still unresolved" in caplog.text
+    finally:
+        claim_task.cancel()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["poll", "cancel", "notification"])
 async def test_single_flight_claim_keeps_owner_until_late_release_settles(phase, monkeypatch):
     monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
@@ -2787,6 +2814,58 @@ async def test_single_flight_claim_keeps_owner_until_late_release_settles(phase,
         if handoffs:
             await asyncio.gather(*handoffs, return_exceptions=True)
         await _wait_for_compensation_tasks_to_clear(service)
+
+
+@pytest.mark.asyncio
+async def test_routine_cancel_release_preserves_existing_diagnostic():
+    release = AsyncMock(return_value=True)
+    service = McpTaskService(
+        repository=SimpleNamespace(release_cancel_claim=release),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    await service._release_cancel_after_cancellation(
+        {
+            "id": "task-1",
+            "lease_token": "lease-1",
+            "last_cancel_error": "remote cancellation failed",
+        }
+    )
+
+    assert release.await_args.kwargs["error"] == "remote cancellation failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notification_status", ["pending", "dispatched"])
+async def test_routine_notification_release_preserves_existing_diagnostic(notification_status):
+    release_claim = AsyncMock(return_value=True)
+    release_lease = AsyncMock(return_value=True)
+    service = McpTaskService(
+        repository=SimpleNamespace(
+            release_notification_claim=release_claim,
+            release_notification_lease=release_lease,
+        ),
+        drivers=McpTaskDriverRegistry(),
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+    )
+
+    await service._release_notification_after_cancellation(
+        {
+            "id": "task-1",
+            "notification_lease_token": "notify-lease-1",
+            "notification_status": notification_status,
+            "notification_error": "notification launch failed",
+        }
+    )
+
+    release = release_lease if notification_status == "dispatched" else release_claim
+    assert release.await_args.kwargs["error"] == "notification launch failed"
+    assert release.await_args.kwargs.get("count_failure", False) is False
 
 
 @pytest.mark.asyncio

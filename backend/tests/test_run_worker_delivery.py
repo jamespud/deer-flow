@@ -750,6 +750,62 @@ async def test_produced_artifact_delivery_fails_closed_when_receipt_cannot_be_pe
 
 
 @pytest.mark.anyio
+async def test_finalization_timeout_does_not_downgrade_success_before_late_receipt(monkeypatch):
+    import deerflow.runtime.runs.worker as worker_module
+
+    run_manager = RunManager()
+    record = await run_manager.create("thread-1")
+    store = MemoryRunEventStore()
+    finalization_finished = asyncio.Event()
+
+    monkeypatch.setattr(worker_module, "_FINALIZATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        worker_module,
+        "_produced_output_paths",
+        AsyncMock(return_value=["/mnt/user-data/outputs/report.md"]),
+    )
+
+    async def late_finalization(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        finalization_finished.set()
+        return True
+
+    monkeypatch.setattr(worker_module, "_persist_journal_and_delivery_receipt", late_finalization)
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            journal = config["context"]["__run_journal"]
+            journal._remember_current_run_tool_calls(
+                AIMessage(content="", tool_calls=[{"id": "call_1", "name": "present_files", "args": {}}]),
+                caller="lead_agent",
+            )
+            journal.on_tool_end(
+                Command(
+                    update={
+                        "artifacts": ["/mnt/user-data/outputs/report.md"],
+                        "messages": [ToolMessage("Successfully presented files", tool_call_id="call_1")],
+                    }
+                ),
+                run_id=uuid4(),
+            )
+            yield {"messages": []}
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=store),
+        agent_factory=lambda *, config: DummyAgent(),
+        graph_input={},
+        config={},
+    )
+
+    assert record.status == RunStatus.success
+    assert record.error is None
+    await asyncio.wait_for(finalization_finished.wait(), timeout=0.2)
+
+
+@pytest.mark.anyio
 async def test_delivery_event_emitted_when_checkpoint_preflight_fails(monkeypatch):
     run_manager = RunManager()
     run_manager.update_run_completion = AsyncMock(wraps=run_manager.update_run_completion)

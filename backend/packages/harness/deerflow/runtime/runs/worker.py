@@ -1245,7 +1245,7 @@ async def run_agent(
             )
             deadline = asyncio.get_running_loop().time() + _FINALIZATION_DRAIN_TIMEOUT_SECONDS
             finalization_completed = await wait_for_task_until(finalization_task, deadline=deadline)
-            receipt_persisted = False
+            receipt_persisted: bool | None = None
             if finalization_completed and not finalization_task.cancelled():
                 try:
                     receipt_persisted = finalization_task.result()
@@ -1257,7 +1257,7 @@ async def run_agent(
                     _FINALIZATION_DRAIN_TIMEOUT_SECONDS,
                     run_id,
                 )
-            if produced_output_paths and record.status == RunStatus.success and not receipt_persisted:
+            if produced_output_paths and record.status == RunStatus.success and receipt_persisted is False:
                 await run_manager.set_status(
                     run_id,
                     RunStatus.error,

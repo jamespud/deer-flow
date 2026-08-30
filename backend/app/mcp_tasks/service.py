@@ -1016,6 +1016,10 @@ class McpTaskService:
         release: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> list[dict[str, Any]]:
         if phase in self._claim_owners:
+            logger.warning(
+                "Skipping MCP %s claim because the previous claim/handoff is still unresolved",
+                phase,
+            )
             return []
 
         claim_task = asyncio.ensure_future(claim())
@@ -1242,7 +1246,7 @@ class McpTaskService:
                 lease_owner=self._lease_owner,
                 lease_token=record["lease_token"],
                 next_cancel_at=datetime.now(UTC),
-                error="cancelled",
+                error=record.get("last_cancel_error"),
             ),
             action="release cancel claim",
             task_id=record["id"],
@@ -1262,7 +1266,7 @@ class McpTaskService:
                 lease_owner=self._lease_owner,
                 notification_lease_token=record["notification_lease_token"],
                 next_notification_at=datetime.now(UTC),
-                error="cancelled",
+                error=record.get("notification_error"),
                 count_failure=False,
             )
             action = "release dispatched notification lease"
@@ -1272,7 +1276,7 @@ class McpTaskService:
                 lease_owner=self._lease_owner,
                 notification_lease_token=record["notification_lease_token"],
                 next_notification_at=datetime.now(UTC),
-                error="cancelled",
+                error=record.get("notification_error"),
                 replace_with_latest=False,
             )
             action = "release notification claim"

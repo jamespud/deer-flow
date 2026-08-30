@@ -477,7 +477,7 @@ class McpTaskRepository:
         lease_owner: str,
         lease_token: str,
         next_cancel_at: datetime,
-        error: str,
+        error: str | None,
     ) -> bool:
         stmt = (
             update(McpTaskRow)
@@ -588,7 +588,7 @@ class McpTaskRepository:
         lease_owner: str,
         notification_lease_token: str,
         next_notification_at: datetime,
-        error: str,
+        error: str | None,
         replace_with_latest: bool,
         count_failure: bool = False,
     ) -> bool:
@@ -681,7 +681,7 @@ class McpTaskRepository:
         lease_owner: str,
         notification_lease_token: str,
         next_notification_at: datetime,
-        error: str,
+        error: str | None,
         count_failure: bool = False,
     ) -> bool:
         """Release unexpected notification work without changing its phase."""
