@@ -1324,7 +1324,7 @@ class RunManager:
             return False
         if not persisted:
             logger.warning(
-                "Skipped late delivery receipt failure for run %s because its durable terminal status already won",
+                "Skipped late delivery receipt failure for run %s because the durable success-to-error correction did not apply",
                 run_id,
             )
             return False

@@ -1586,6 +1586,26 @@ async def test_late_delivery_failure_does_not_overwrite_peer_terminal_status():
 
 
 @pytest.mark.anyio
+async def test_late_delivery_failure_does_not_stage_active_run_without_durable_success():
+    store = MemoryRunStore()
+    manager = RunManager(store=store)
+    record = await manager.create("thread-1")
+    assert await manager.try_start(record.run_id) is RunStartOutcome.started
+
+    corrected = await manager.mark_delivery_receipt_failed(
+        record.run_id,
+        error="receipt missing",
+    )
+
+    assert corrected is False
+    assert record.status is RunStatus.running
+    assert record.error is None
+    persisted = await store.get(record.run_id)
+    assert persisted is not None
+    assert persisted["status"] == RunStatus.running.value
+
+
+@pytest.mark.anyio
 async def test_completion_persistence_recreates_missing_store_row():
     """Completion updates should recreate a missing row and persist final counters."""
     store = MissingCompletionRunStore()

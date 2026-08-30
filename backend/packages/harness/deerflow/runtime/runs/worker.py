@@ -672,6 +672,7 @@ async def run_agent(
     # completion snapshot into RunStore.
     persist_completion = False
     completion_data: dict[str, Any] | None = None
+    terminal_status_settled = asyncio.Event()
     # Buffers subagent step events for batched persistence (#3779); assigned once
     # streaming starts and flushed in the finally block. Pre-bound to None so the
     # finally is safe even if an exception fires before streaming begins.
@@ -1253,15 +1254,47 @@ async def run_agent(
                         extra_excluded_dir_names=workspace_excluded_dir_names,
                     )
                 delivery_content = _delivery_content_with_outputs(journal.get_delivery_content(), produced_output_paths)
-            finalization_task = asyncio.create_task(
-                _persist_journal_and_delivery_receipt(
-                    journal,
-                    event_store,
-                    thread_id=thread_id,
-                    run_id=run_id,
-                    content=delivery_content,
-                )
-            )
+            finalization_result: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+            finalization_outcome_released = asyncio.Event()
+            finalization_timed_out = False
+
+            async def persist_finalization() -> bool:
+                try:
+                    result = await _persist_journal_and_delivery_receipt(
+                        journal,
+                        event_store,
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        content=delivery_content,
+                    )
+                except BaseException as exc:
+                    finalization_result.set_exception(exc)
+                    # The worker may already have timed out and stopped
+                    # awaiting this outcome. Mark the exception retrieved so
+                    # the supervised task remains the sole failure reporter.
+                    try:
+                        finalization_result.exception()
+                    except BaseException:
+                        pass
+                    raise
+                finalization_result.set_result(result)
+                if result is False:
+                    # Keep reconciliation in this already-supervised task.
+                    # The worker releases the gate after classifying the
+                    # result, so a fast failure cannot be mistaken for a late
+                    # one and shutdown cannot miss a newly-created task.
+                    await finalization_outcome_released.wait()
+                    if finalization_timed_out:
+                        await terminal_status_settled.wait()
+                        await _reconcile_late_delivery_failure(
+                            run_manager,
+                            record,
+                            run_id=run_id,
+                            produced_output_paths=produced_output_paths,
+                        )
+                return result
+
+            finalization_task = asyncio.create_task(persist_finalization())
             finalization_task.set_name(f"deerflow-run-finalization-{run_id}")
             run_manager.track_background_finalization(
                 finalization_task,
@@ -1269,110 +1302,102 @@ async def run_agent(
                 run_id=run_id,
             )
             deadline = asyncio.get_running_loop().time() + _FINALIZATION_DRAIN_TIMEOUT_SECONDS
-            finalization_completed = await wait_for_task_until(finalization_task, deadline=deadline)
+            finalization_completed = await wait_for_task_until(finalization_result, deadline=deadline)
             receipt_persisted: bool | None = None
-            if finalization_completed and not finalization_task.cancelled():
+            if finalization_completed and not finalization_result.cancelled():
+                finalization_outcome_released.set()
                 try:
-                    receipt_persisted = finalization_task.result()
+                    receipt_persisted = finalization_result.result()
                 except BaseException:
                     pass
             elif not finalization_completed:
-
-                def reconcile_late_result(completed: asyncio.Future[bool]) -> None:
-                    try:
-                        late_receipt_persisted = completed.result()
-                    except BaseException:
-                        return
-                    if late_receipt_persisted is not False:
-                        return
-                    reconciliation = asyncio.create_task(
-                        _reconcile_late_delivery_failure(
-                            run_manager,
-                            record,
-                            run_id=run_id,
-                            produced_output_paths=produced_output_paths,
-                        ),
-                        name=f"deerflow-run-late-delivery-failure-{run_id}",
-                    )
-                    run_manager.track_background_finalization(
-                        reconciliation,
-                        action="persist late delivery receipt failure status",
-                        run_id=run_id,
-                    )
-
-                finalization_task.add_done_callback(reconcile_late_result)
+                finalization_timed_out = True
+                finalization_outcome_released.set()
                 logger.warning(
                     "Timed out after %.1f seconds waiting for ordered journal and delivery receipt finalization for run %s; it continues in the background",
                     _FINALIZATION_DRAIN_TIMEOUT_SECONDS,
                     run_id,
                 )
-            if produced_output_paths and record.status == RunStatus.success and receipt_persisted is False:
-                await run_manager.set_status(
-                    run_id,
-                    RunStatus.error,
-                    error=_DELIVERY_RECEIPT_FAILED_ERROR,
-                    persist=False,
-                )
 
-        if not record.ownership_lost and journal is not None and persist_completion:
-            try:
-                # Advance the final completion fields and timestamp without
-                # terminalizing the durable row. That active row continues to
-                # fence peer checkpoint writers through the duration write.
-                completion_data = journal.get_completion_data()
-                await run_manager.update_finalizing_progress(run_id, **completion_data)
-            except Exception:
-                logger.warning("Failed to persist finalizing run progress for %s (non-fatal)", run_id, exc_info=True)
+            async def _persist_terminal_and_completion() -> None:
+                nonlocal completion_data
 
-        # Keep the durable run row active through its final duration checkpoint
-        # write. A peer Gateway admits history migration from the durable row,
-        # not this worker's staged terminal status; terminalizing first would
-        # let that migration read an unfinished lifetime and race this write.
-        if started and not record.ownership_lost and checkpointer is not None and record.status == RunStatus.success:
-            try:
-                created = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
-                updated = datetime.fromisoformat(record.updated_at.replace("Z", "+00:00"))
-                # Match legacy history semantics: turn_duration is the whole
-                # RunRecord lifetime in integer seconds, including admission
-                # delay. Persist zero for sub-second successful turns.
-                duration = max(0, int((updated - created).total_seconds()))
-                await _persist_run_duration(
-                    checkpointer=checkpointer,
-                    thread_id=thread_id,
-                    run_id=run_id,
-                    duration_seconds=duration,
-                )
-            except Exception:
-                logger.debug("Failed to persist run duration for thread %s run %s (non-fatal)", thread_id, run_id)
-
-        if not record.ownership_lost and event_store is not None:
-            try:
-                # Even after bounded receipt retries are exhausted, persist the
-                # real worker outcome. Leaving a successful row inflight would
-                # let lease recovery rewrite it as an error with a synthetic
-                # zero receipt.
-                if record.abort_event.is_set():
-                    await run_manager.persist_current_status(run_id)
-                else:
-                    cancel_action = await run_manager.set_status_if_not_cancelled(
+                if produced_output_paths and record.status == RunStatus.success and receipt_persisted is False:
+                    await run_manager.set_status(
                         run_id,
-                        record.status,
-                        error=record.error,
-                        stop_reason=record.stop_reason,
+                        RunStatus.error,
+                        error=_DELIVERY_RECEIPT_FAILED_ERROR,
+                        persist=False,
                     )
-                    if cancel_action is not None:
-                        await _finish_cancellation(cancel_action)
-                        await run_manager.persist_current_status(run_id)
-            except Exception:
-                logger.warning("Failed to persist terminal status for run %s after delivery receipt attempts", run_id, exc_info=True)
 
-        if not record.ownership_lost and journal is not None and persist_completion:
+                if not record.ownership_lost and journal is not None and persist_completion:
+                    try:
+                        # Advance the final completion fields and timestamp without
+                        # terminalizing the durable row. That active row continues to
+                        # fence peer checkpoint writers through the duration write.
+                        completion_data = journal.get_completion_data()
+                        await run_manager.update_finalizing_progress(run_id, **completion_data)
+                    except Exception:
+                        logger.warning("Failed to persist finalizing run progress for %s (non-fatal)", run_id, exc_info=True)
+
+                # Keep the durable run row active through its final duration checkpoint
+                # write. A peer Gateway admits history migration from the durable row,
+                # not this worker's staged terminal status; terminalizing first would
+                # let that migration read an unfinished lifetime and race this write.
+                if started and not record.ownership_lost and checkpointer is not None and record.status == RunStatus.success:
+                    try:
+                        created = datetime.fromisoformat(record.created_at.replace("Z", "+00:00"))
+                        updated = datetime.fromisoformat(record.updated_at.replace("Z", "+00:00"))
+                        # Match legacy history semantics: turn_duration is the whole
+                        # RunRecord lifetime in integer seconds, including admission
+                        # delay. Persist zero for sub-second successful turns.
+                        duration = max(0, int((updated - created).total_seconds()))
+                        await _persist_run_duration(
+                            checkpointer=checkpointer,
+                            thread_id=thread_id,
+                            run_id=run_id,
+                            duration_seconds=duration,
+                        )
+                    except Exception:
+                        logger.debug("Failed to persist run duration for thread %s run %s (non-fatal)", thread_id, run_id)
+
+                if not record.ownership_lost and event_store is not None:
+                    try:
+                        # Even after bounded receipt retries are exhausted, persist the
+                        # real worker outcome. Leaving a successful row inflight would
+                        # let lease recovery rewrite it as an error with a synthetic
+                        # zero receipt.
+                        if record.abort_event.is_set():
+                            await run_manager.persist_current_status(run_id)
+                        else:
+                            cancel_action = await run_manager.set_status_if_not_cancelled(
+                                run_id,
+                                record.status,
+                                error=record.error,
+                                stop_reason=record.stop_reason,
+                            )
+                            if cancel_action is not None:
+                                await _finish_cancellation(cancel_action)
+                                await run_manager.persist_current_status(run_id)
+                    except Exception:
+                        logger.warning("Failed to persist terminal status for run %s after delivery receipt attempts", run_id, exc_info=True)
+
+                if not record.ownership_lost and journal is not None and persist_completion:
+                    try:
+                        # Persist token usage + convenience fields to RunStore
+                        completion_data = completion_data or journal.get_completion_data()
+                        await run_manager.update_run_completion(run_id, status=record.status.value, **completion_data)
+                    except Exception:
+                        logger.warning("Failed to persist run completion for %s (non-fatal)", run_id, exc_info=True)
+
+            # Late receipt reconciliation must observe every normal durable
+            # terminal write, including completion fields that can also carry the
+            # terminal status. Cancellation or failure in any write path must
+            # release the barrier so retained finalization can settle.
             try:
-                # Persist token usage + convenience fields to RunStore
-                completion_data = completion_data or journal.get_completion_data()
-                await run_manager.update_run_completion(run_id, status=record.status.value, **completion_data)
-            except Exception:
-                logger.warning("Failed to persist run completion for %s (non-fatal)", run_id, exc_info=True)
+                await _persist_terminal_and_completion()
+            finally:
+                terminal_status_settled.set()
 
         if started and not record.ownership_lost and checkpointer is not None and record.status == RunStatus.interrupted and not _is_edit_replay_run(record):
             try:
@@ -1410,8 +1435,6 @@ async def run_agent(
                 logger.warning("Run completion hook failed for %s (non-fatal)", run_id, exc_info=True)
 
         if task_info is not None and task_store is not None:
-            # Keep the finalizing barrier held until stop observers finish, so
-            # a same-thread replacement cannot overlap this task's lifecycle.
             try:
                 await notify_task_stop(
                     extensions,

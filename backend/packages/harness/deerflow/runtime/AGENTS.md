@@ -261,3 +261,9 @@ receipt failure, a success-to-error correction is applied through the narrow
 `RunManager.mark_delivery_receipt_failed` success-guarded store operation;
 another terminal outcome is never overwritten. Shutdown observes the same
 owner only within its caller-provided absolute deadline.
+The worker releases the terminal-status barrier from a `finally` covering
+finalizing progress, duration, terminal-status, and completion writes, so a
+cancellation in any intermediate await cannot strand the retained
+reconciliation task. The correction operation returns success only for an
+actual durable `success`-to-`error` CAS; an active `pending`/`running` row is
+left untouched for its owning worker or recovery path.
