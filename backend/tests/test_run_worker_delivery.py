@@ -995,6 +995,270 @@ async def test_late_finalization_failure_corrects_success_after_timeout(monkeypa
 
 
 @pytest.mark.anyio
+async def test_late_finalization_failure_reconciles_after_terminal_barrier_deadline(monkeypatch):
+    """A hung completion write must not strand a confirmed receipt failure."""
+    import deerflow.runtime.runs.worker as worker_module
+
+    class BlockingCompletionStore(MemoryRunStore):
+        def __init__(self):
+            super().__init__()
+            self.completion_started = asyncio.Event()
+            self.release_completion = asyncio.Event()
+            self.mark_started = asyncio.Event()
+
+        async def update_run_completion(self, run_id, *, status, **kwargs):
+            self.completion_started.set()
+            await self.release_completion.wait()
+            return await super().update_run_completion(run_id, status=status, **kwargs)
+
+        async def mark_delivery_receipt_failed(self, run_id: str, *, error: str) -> bool:
+            self.mark_started.set()
+            return await super().mark_delivery_receipt_failed(run_id, error=error)
+
+    run_store = BlockingCompletionStore()
+    run_manager = RunManager(store=run_store)
+    record = await run_manager.create("thread-1")
+    event_store = MemoryRunEventStore()
+    finalization_finished = asyncio.Event()
+
+    monkeypatch.setattr(worker_module, "_FINALIZATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(worker_module, "capture_workspace_snapshot", AsyncMock(return_value=WorkspaceSnapshot()))
+    monkeypatch.setattr(worker_module, "record_workspace_changes", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        worker_module,
+        "_produced_output_paths",
+        AsyncMock(return_value=["/mnt/user-data/outputs/report.md"]),
+    )
+
+    async def late_finalization(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        finalization_finished.set()
+        return False
+
+    monkeypatch.setattr(worker_module, "_persist_journal_and_delivery_receipt", late_finalization)
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            journal = config["context"]["__run_journal"]
+            journal._remember_current_run_tool_calls(
+                AIMessage(content="", tool_calls=[{"id": "call_1", "name": "present_files", "args": {}}]),
+                caller="lead_agent",
+            )
+            journal.on_tool_end(
+                Command(
+                    update={
+                        "artifacts": ["/mnt/user-data/outputs/report.md"],
+                        "messages": [ToolMessage("Successfully presented files", tool_call_id="call_1")],
+                    }
+                ),
+                run_id=uuid4(),
+            )
+            yield {"messages": []}
+
+    task = asyncio.create_task(
+        run_agent(
+            _make_bridge(),
+            run_manager,
+            record,
+            ctx=RunContext(checkpointer=None, event_store=event_store),
+            agent_factory=lambda *, config: DummyAgent(),
+            graph_input={},
+            config={},
+        )
+    )
+    record.task = task
+    try:
+        await asyncio.wait_for(run_store.completion_started.wait(), timeout=1.0)
+        await asyncio.wait_for(finalization_finished.wait(), timeout=1.0)
+
+        persisted = await run_store.get(record.run_id)
+        assert persisted is not None
+        assert persisted["status"] == RunStatus.success.value
+
+        await asyncio.wait_for(run_store.mark_started.wait(), timeout=0.5)
+    finally:
+        run_store.release_completion.set()
+        await asyncio.gather(task, return_exceptions=True)
+        for finalization_task in tuple(run_manager._background_finalization_tasks):
+            finalization_task.cancel()
+        if run_manager._background_finalization_tasks:
+            await asyncio.gather(*run_manager._background_finalization_tasks, return_exceptions=True)
+
+    persisted = await run_store.get(record.run_id)
+    assert persisted is not None
+    assert persisted["status"] == RunStatus.error.value
+    assert persisted["error"] == "Artifact delivery verification failed: terminal delivery receipt could not be persisted"
+
+
+@pytest.mark.anyio
+async def test_late_finalization_failure_retries_after_status_writer_deadline(monkeypatch):
+    """A late CAS miss must be retried after a still-running status writer settles."""
+    import deerflow.runtime.runs.worker as worker_module
+
+    class BlockingStatusStore(MemoryRunStore):
+        def __init__(self):
+            super().__init__()
+            self.status_started = asyncio.Event()
+            self.release_status = asyncio.Event()
+            self.mark_started = asyncio.Event()
+            self.mark_results: list[bool] = []
+
+        async def update_status(self, run_id, status, *, error=None, stop_reason=None):
+            self.status_started.set()
+            await self.release_status.wait()
+            return await super().update_status(run_id, status, error=error, stop_reason=stop_reason)
+
+        async def mark_delivery_receipt_failed(self, run_id: str, *, error: str) -> bool:
+            self.mark_started.set()
+            corrected = await super().mark_delivery_receipt_failed(run_id, error=error)
+            self.mark_results.append(corrected)
+            return corrected
+
+    run_store = BlockingStatusStore()
+    run_manager = RunManager(store=run_store)
+    record = await run_manager.create("thread-1")
+    event_store = MemoryRunEventStore()
+    finalization_finished = asyncio.Event()
+
+    monkeypatch.setattr(worker_module, "_FINALIZATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(worker_module, "capture_workspace_snapshot", AsyncMock(return_value=WorkspaceSnapshot()))
+    monkeypatch.setattr(worker_module, "record_workspace_changes", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        worker_module,
+        "_produced_output_paths",
+        AsyncMock(return_value=["/mnt/user-data/outputs/report.md"]),
+    )
+
+    async def late_finalization(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        finalization_finished.set()
+        return False
+
+    monkeypatch.setattr(worker_module, "_persist_journal_and_delivery_receipt", late_finalization)
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            journal = config["context"]["__run_journal"]
+            journal._remember_current_run_tool_calls(
+                AIMessage(content="", tool_calls=[{"id": "call_1", "name": "present_files", "args": {}}]),
+                caller="lead_agent",
+            )
+            journal.on_tool_end(
+                Command(
+                    update={
+                        "artifacts": ["/mnt/user-data/outputs/report.md"],
+                        "messages": [ToolMessage("Successfully presented files", tool_call_id="call_1")],
+                    }
+                ),
+                run_id=uuid4(),
+            )
+            yield {"messages": []}
+
+    task = asyncio.create_task(
+        run_agent(
+            _make_bridge(),
+            run_manager,
+            record,
+            ctx=RunContext(checkpointer=None, event_store=event_store),
+            agent_factory=lambda *, config: DummyAgent(),
+            graph_input={},
+            config={},
+        )
+    )
+    record.task = task
+    try:
+        await asyncio.wait_for(run_store.status_started.wait(), timeout=1.0)
+        await asyncio.wait_for(finalization_finished.wait(), timeout=1.0)
+        await asyncio.wait_for(run_store.mark_started.wait(), timeout=0.5)
+
+        assert run_store.mark_results == [False]
+        persisted = await run_store.get(record.run_id)
+        assert persisted is not None
+        assert persisted["status"] == RunStatus.running.value
+
+        run_store.release_status.set()
+        await asyncio.wait_for(task, timeout=1.0)
+        async with asyncio.timeout(1.0):
+            while run_manager._background_finalization_tasks:
+                await asyncio.sleep(0)
+        assert run_store.mark_results == [False, True]
+    finally:
+        run_store.release_status.set()
+        await asyncio.gather(task, return_exceptions=True)
+        for finalization_task in tuple(run_manager._background_finalization_tasks):
+            finalization_task.cancel()
+        if run_manager._background_finalization_tasks:
+            await asyncio.gather(*run_manager._background_finalization_tasks, return_exceptions=True)
+
+    persisted = await run_store.get(record.run_id)
+    assert persisted is not None
+    assert persisted["status"] == RunStatus.error.value
+    assert persisted["error"] == "Artifact delivery verification failed: terminal delivery receipt could not be persisted"
+
+
+@pytest.mark.anyio
+async def test_ownership_loss_releases_late_reconciliation_barrier(monkeypatch):
+    """A fenced worker must release a barrier that its writers will skip."""
+    import deerflow.runtime.runs.worker as worker_module
+
+    run_manager = RunManager(store=MemoryRunStore())
+    record = await run_manager.create("thread-1")
+    event_store = MemoryRunEventStore()
+    finalization_finished = asyncio.Event()
+
+    monkeypatch.setattr(worker_module, "_FINALIZATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(worker_module, "capture_workspace_snapshot", AsyncMock(return_value=WorkspaceSnapshot()))
+    monkeypatch.setattr(worker_module, "record_workspace_changes", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        worker_module,
+        "_produced_output_paths",
+        AsyncMock(return_value=["/mnt/user-data/outputs/report.md"]),
+    )
+
+    async def late_finalization(*args, **kwargs):
+        record.ownership_lost = True
+        await asyncio.sleep(0.05)
+        finalization_finished.set()
+        return False
+
+    monkeypatch.setattr(worker_module, "_persist_journal_and_delivery_receipt", late_finalization)
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            journal = config["context"]["__run_journal"]
+            journal._remember_current_run_tool_calls(
+                AIMessage(content="", tool_calls=[{"id": "call_1", "name": "present_files", "args": {}}]),
+                caller="lead_agent",
+            )
+            journal.on_tool_end(
+                Command(
+                    update={
+                        "artifacts": ["/mnt/user-data/outputs/report.md"],
+                        "messages": [ToolMessage("Successfully presented files", tool_call_id="call_1")],
+                    }
+                ),
+                run_id=uuid4(),
+            )
+            yield {"messages": []}
+
+    await run_agent(
+        _make_bridge(),
+        run_manager,
+        record,
+        ctx=RunContext(checkpointer=None, event_store=event_store),
+        agent_factory=lambda *, config: DummyAgent(),
+        graph_input={},
+        config={},
+    )
+
+    await asyncio.wait_for(finalization_finished.wait(), timeout=1.0)
+    assert record.ownership_lost is True
+    async with asyncio.timeout(0.3):
+        while run_manager._background_finalization_tasks:
+            await asyncio.sleep(0)
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("heartbeat_enabled", [False, True])
 async def test_late_finalization_failure_before_terminal_write_is_not_lost(monkeypatch, heartbeat_enabled):
     import deerflow.runtime.runs.worker as worker_module

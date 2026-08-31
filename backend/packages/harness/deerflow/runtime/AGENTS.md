@@ -265,6 +265,13 @@ owner only within its caller-provided absolute deadline.
 The worker releases the terminal-status barrier from a `finally` covering
 finalizing progress, duration, terminal-status, and completion writes, so a
 cancellation in any intermediate await cannot strand the retained
-reconciliation task. The correction operation returns success only for an
-actual durable `success`-to-`error` CAS; an active `pending`/`running` row is
-left untouched for its owning worker or recovery path.
+reconciliation task. If lease ownership is lost before those writers begin,
+the writer body is skipped but the same `finally` still marks the barrier
+settled because no local durable writer can run. Late reconciliation waits for
+that barrier only within a bounded drain window; if the window expires, it still attempts the same narrow
+durable correction against the current row. The correction operation returns
+success only for an actual durable `success`-to-`error` CAS; an active
+`pending`/`running` row is left untouched for its owning worker or recovery
+path. Terminal, duration, and completion stages retain their independent
+guards, so embedded runs without an event-store journal still persist duration
+checkpoints when a checkpointer is configured.
