@@ -1709,3 +1709,274 @@ async def test_worker_cancel_with_late_receipt_failure_releases_terminal_barrier
         await asyncio.wait_for(reconciliation[0], timeout=0.5)
     await asyncio.sleep(0)
     assert not any(t.get_name().startswith("deerflow-run-delivery-reconciliation-") for t in run_manager._background_finalization_tasks)
+
+
+@pytest.mark.anyio
+async def test_worker_cancel_during_finalization_wait_publishes_end(monkeypatch):
+    """A cancellation at the foreground finalization wait must propagate to the
+    caller but only AFTER the run lifecycle closes (publish_end runs)."""
+    import deerflow.runtime.runs.worker as worker_module
+
+    run_manager = RunManager()
+    record = await run_manager.create("thread-cancel-publish-end")
+    store = MemoryRunEventStore()
+    bridge = _make_bridge()
+    finalization_started = asyncio.Event()
+    release_finalization = asyncio.Event()
+
+    monkeypatch.setattr(worker_module, "_FINALIZATION_DRAIN_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(worker_module, "_LIFECYCLE_CLOSE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(worker_module, "capture_workspace_snapshot", AsyncMock(return_value=WorkspaceSnapshot()))
+    monkeypatch.setattr(worker_module, "record_workspace_changes", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        worker_module,
+        "_produced_output_paths",
+        AsyncMock(return_value=["/mnt/user-data/outputs/report.md"]),
+    )
+
+    async def blocking_finalization(*args, **kwargs):
+        finalization_started.set()
+        await release_finalization.wait()
+        return True
+
+    monkeypatch.setattr(worker_module, "_persist_journal_and_delivery_receipt", blocking_finalization)
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            del graph_input, stream_mode, subgraphs
+            journal = config["context"]["__run_journal"]
+            journal._remember_current_run_tool_calls(
+                AIMessage(content="", tool_calls=[{"id": "call_1", "name": "present_files", "args": {}}]),
+                caller="lead_agent",
+            )
+            journal.on_tool_end(
+                Command(
+                    update={
+                        "artifacts": ["/mnt/user-data/outputs/report.md"],
+                        "messages": [ToolMessage("done", tool_call_id="call_1")],
+                    }
+                ),
+                run_id=uuid4(),
+            )
+            yield {"messages": []}
+
+    run_agent_task = asyncio.create_task(
+        run_agent(
+            bridge,
+            run_manager,
+            record,
+            ctx=RunContext(checkpointer=None, event_store=store),
+            agent_factory=lambda *, config: DummyAgent(),
+            graph_input={},
+            config={},
+        )
+    )
+    await asyncio.wait_for(finalization_started.wait(), timeout=1.0)
+    await asyncio.sleep(0)
+    run_agent_task.cancel()
+    try:
+        await asyncio.wait_for(run_agent_task, timeout=0.5)
+    except asyncio.CancelledError:
+        pass
+    else:
+        pytest.fail("worker swallowed caller cancellation during finalization wait")
+    finally:
+        release_finalization.set()
+        await asyncio.sleep(0)
+
+    # The cancellation must not truncate the run lifecycle: the stream must still
+    # receive its END frame.
+    bridge.publish_end.assert_awaited_once_with(record.run_id)
+
+
+@pytest.mark.anyio
+async def test_worker_cancel_during_finalization_wait_clears_finalizing(monkeypatch):
+    """A cancelled worker must still clear the finalizing flag, or the thread
+    stays inflight and blocks later admission / wait_for_prior_finalizing."""
+    import deerflow.runtime.runs.worker as worker_module
+
+    run_manager = RunManager()
+    record = await run_manager.create("thread-cancel-finalizing")
+    store = MemoryRunEventStore()
+    bridge = _make_bridge()
+    finalization_started = asyncio.Event()
+    release_finalization = asyncio.Event()
+
+    monkeypatch.setattr(worker_module, "_FINALIZATION_DRAIN_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(worker_module, "_LIFECYCLE_CLOSE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(worker_module, "capture_workspace_snapshot", AsyncMock(return_value=WorkspaceSnapshot()))
+    monkeypatch.setattr(worker_module, "record_workspace_changes", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        worker_module,
+        "_produced_output_paths",
+        AsyncMock(return_value=["/mnt/user-data/outputs/report.md"]),
+    )
+
+    async def blocking_finalization(*args, **kwargs):
+        finalization_started.set()
+        await release_finalization.wait()
+        return True
+
+    monkeypatch.setattr(worker_module, "_persist_journal_and_delivery_receipt", blocking_finalization)
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            del graph_input, stream_mode, subgraphs
+            journal = config["context"]["__run_journal"]
+            journal._remember_current_run_tool_calls(
+                AIMessage(content="", tool_calls=[{"id": "call_1", "name": "present_files", "args": {}}]),
+                caller="lead_agent",
+            )
+            journal.on_tool_end(
+                Command(
+                    update={
+                        "artifacts": ["/mnt/user-data/outputs/report.md"],
+                        "messages": [ToolMessage("done", tool_call_id="call_1")],
+                    }
+                ),
+                run_id=uuid4(),
+            )
+            yield {"messages": []}
+
+    run_agent_task = asyncio.create_task(
+        run_agent(
+            bridge,
+            run_manager,
+            record,
+            ctx=RunContext(checkpointer=None, event_store=store),
+            agent_factory=lambda *, config: DummyAgent(),
+            graph_input={},
+            config={},
+        )
+    )
+    await asyncio.wait_for(finalization_started.wait(), timeout=1.0)
+    await asyncio.sleep(0)
+    # Simulate a run already flagged as doing post-cancel cleanup.
+    record.finalizing = True
+    run_agent_task.cancel()
+    try:
+        await asyncio.wait_for(run_agent_task, timeout=0.5)
+    except asyncio.CancelledError:
+        pass
+    else:
+        pytest.fail("worker swallowed caller cancellation during finalization wait")
+    finally:
+        release_finalization.set()
+        await asyncio.sleep(0)
+
+    assert record.finalizing is False, "cancelled run must not stay finalizing (blocks the thread inflight)"
+    assert await run_manager.has_inflight("thread-cancel-finalizing") is False
+
+
+@pytest.mark.anyio
+async def test_worker_cancel_late_failure_waits_for_terminal_persistence(monkeypatch):
+    """Late success->error correction must not run before the lifecycle terminal
+    persistence finishes: ``terminal_status_settled`` reflects the terminal write
+    path, not the worker cancellation."""
+    import deerflow.runtime.runs.worker as worker_module
+
+    run_manager = RunManager()
+    record = await run_manager.create("thread-cancel-ordering")
+    store = MemoryRunEventStore()
+    bridge = _make_bridge()
+    finalization_started = asyncio.Event()
+    release_finalization = asyncio.Event()
+    terminal_write_started = asyncio.Event()
+    release_terminal_write = asyncio.Event()
+
+    mark_failed = AsyncMock(return_value=False)
+    monkeypatch.setattr(run_manager, "mark_delivery_receipt_failed", mark_failed)
+
+    monkeypatch.setattr(worker_module, "capture_workspace_snapshot", AsyncMock(return_value=WorkspaceSnapshot()))
+    monkeypatch.setattr(worker_module, "record_workspace_changes", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        worker_module,
+        "_produced_output_paths",
+        AsyncMock(return_value=["/mnt/user-data/outputs/report.md"]),
+    )
+
+    async def failing_finalization(*args, **kwargs):
+        finalization_started.set()
+        await release_finalization.wait()
+        return False
+
+    monkeypatch.setattr(worker_module, "_persist_journal_and_delivery_receipt", failing_finalization)
+
+    real_update_finalizing_progress = run_manager.update_finalizing_progress
+
+    async def blocking_terminal_write(run_id, **kwargs):
+        terminal_write_started.set()
+        await release_terminal_write.wait()
+        return await real_update_finalizing_progress(run_id, **kwargs)
+
+    monkeypatch.setattr(run_manager, "update_finalizing_progress", blocking_terminal_write)
+
+    class DummyAgent:
+        async def astream(self, graph_input, config=None, stream_mode=None, subgraphs=False):
+            del graph_input, stream_mode, subgraphs
+            journal = config["context"]["__run_journal"]
+            journal._remember_current_run_tool_calls(
+                AIMessage(content="", tool_calls=[{"id": "call_1", "name": "present_files", "args": {}}]),
+                caller="lead_agent",
+            )
+            journal.on_tool_end(
+                Command(
+                    update={
+                        "artifacts": ["/mnt/user-data/outputs/report.md"],
+                        "messages": [ToolMessage("done", tool_call_id="call_1")],
+                    }
+                ),
+                run_id=uuid4(),
+            )
+            yield {"messages": []}
+
+    run_agent_task = asyncio.create_task(
+        run_agent(
+            bridge,
+            run_manager,
+            record,
+            ctx=RunContext(checkpointer=None, event_store=store),
+            agent_factory=lambda *, config: DummyAgent(),
+            graph_input={},
+            config={},
+        )
+    )
+    try:
+        await asyncio.wait_for(finalization_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        run_agent_task.cancel()
+        # The lifecycle close is now running and blocked in terminal persistence.
+        await asyncio.wait_for(terminal_write_started.wait(), timeout=1.0)
+
+        # Let the retained finalization confirm a receipt failure.
+        release_finalization.set()
+        await asyncio.sleep(0.1)
+
+        # Terminal persistence is still blocked, so the late success->error
+        # correction must NOT have run yet.
+        mark_failed.assert_not_awaited()
+
+        # Release the terminal write; only now may the late correction proceed,
+        # and the worker re-raises the original cancellation after the lifecycle
+        # closes.
+        release_terminal_write.set()
+        try:
+            await asyncio.wait_for(run_agent_task, timeout=1.0)
+        except asyncio.CancelledError:
+            pass
+        else:
+            pytest.fail("worker swallowed caller cancellation during finalization wait")
+
+        # The late correction must eventually run once terminal persistence is done.
+        async with asyncio.timeout(1.0):
+            while mark_failed.await_count == 0:
+                await asyncio.sleep(0)
+        mark_failed.assert_awaited()
+    finally:
+        release_finalization.set()
+        release_terminal_write.set()
+        await asyncio.gather(run_agent_task, return_exceptions=True)
+        for background in list(run_manager._background_finalization_tasks):
+            background.cancel()
+        if run_manager._background_finalization_tasks:
+            await asyncio.gather(*run_manager._background_finalization_tasks, return_exceptions=True)
