@@ -243,10 +243,13 @@ still-unowned detached batch instead. Do not reintroduce a direct
 `except CancelledError: requeue` around event-store writes.
 Progress quiescence consumes a progress task's own cancellation, re-reads the
 current task after completion, and cancels any delayed replacement it created;
-a hung in-flight snapshot remains owned after its bounded observation and does
-not block buffered events. Cancellation checks compare the task's count before
-and after an absorbing wait, so an already-handled historical request is not
-raised as a new cancellation.
+A hung in-flight snapshot is cancelled after its bounded observation; if
+cancellation is not immediately cooperative, a module-level settlement registry
+keeps a strong root until the task settles while the journal retains its local
+reference. Delayed-task cleanup is identity-guarded so a completed task cannot
+clear scheduling metadata installed for a replacement.
+Cancellation checks compare the task's count before and after an absorbing wait,
+so an already-handled historical request is not raised as a new cancellation.
 
 The worker computes delivery content, starts one child pipeline that calls
 `flush_until_settled()` and only then writes the idempotent `run.delivery`

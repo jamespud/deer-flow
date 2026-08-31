@@ -1,5 +1,7 @@
 import asyncio
+import gc
 import logging
+import weakref
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -3669,6 +3671,7 @@ async def test_ordinary_batch_release_is_handed_off_without_duplication(phase, o
 
         repo.release_gate.set()
         await _wait_for_compensation_tasks_to_clear(service)
+
         assert repo.release_calls == ["task-1"]
         if outcome == "success":
             assert repo.release_completed is True
@@ -3685,6 +3688,44 @@ async def test_ordinary_batch_release_is_handed_off_without_duplication(phase, o
             with pytest.raises(asyncio.CancelledError):
                 await caller
         await _wait_for_compensation_tasks_to_clear(service)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["poll", "cancel", "notification"])
+async def test_ordinary_batch_release_timeout_has_service_owned_strong_root(phase, monkeypatch):
+    monkeypatch.setattr(service_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01)
+    repo = OrdinaryReleaseBatchRepository(phase=phase, outcome="success")
+    drivers = McpTaskDriverRegistry()
+    if phase == "poll":
+        drivers.register("fake", FakeDriver(error=RuntimeError("poll failed")))
+    elif phase == "cancel":
+        drivers.register("fake", FakeDriver(cancel_error=RuntimeError("cancel failed")))
+    service = McpTaskService(
+        repository=repo,
+        drivers=drivers,
+        poll_interval_seconds=5,
+        lease_seconds=120,
+        max_concurrent_polls=3,
+        launch_notification=AsyncMock(side_effect=ConflictError("thread busy")),
+        get_run=AsyncMock(return_value=None),
+    )
+    caller = asyncio.create_task(_run_batch_probe(service, phase))
+    await repo.release_started.wait()
+    await caller
+
+    assert len(service._compensation_tasks) == 1
+    release_task = next(iter(service._compensation_tasks))
+    release_ref = weakref.ref(release_task)
+
+    del release_task
+    del caller
+    gc.collect()
+    assert release_ref() is not None
+
+    repo.release_gate.set()
+    await _wait_for_compensation_tasks_to_clear(service)
+    await asyncio.sleep(0)
+    assert not service._compensation_tasks
 
 
 @pytest.mark.asyncio

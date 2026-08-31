@@ -54,6 +54,7 @@ _LEGACY_SUMMARY_MESSAGE_NAME = "summary"
 _RECONCILED_TOOL_MESSAGE_NAMES = frozenset({"ask_clarification"})
 _PERSISTED_HIDDEN_HUMAN_INPUT_RESPONSE_SOURCES = frozenset({"ask_clarification"})
 _CANCELLATION_DRAIN_TIMEOUT_SECONDS = 5.0
+_cancelling_progress_tasks: set[asyncio.Future[Any]] = set()
 
 
 @dataclass
@@ -685,7 +686,7 @@ class RunJournal(BaseCallbackHandler):
         self._pending_flush_tasks.add(task)
         task.add_done_callback(lambda completed: self._on_flush_done(completed, detached=detached))
 
-    async def _put_batch_cancellation_safe(self, batch: list[dict]) -> None:
+    async def _put_batch_cancellation_safe(self, batch: list[dict]) -> bool:
         """Write one batch, bounded by a drain deadline whether or not the caller is cancelled."""
         write_task = asyncio.create_task(self._store.put_batch(batch))
         write_task.set_name(f"deerflow-journal-put-batch-{self.run_id}")
@@ -707,7 +708,7 @@ class RunJournal(BaseCallbackHandler):
             )
             if caller_cancelling:
                 raise asyncio.CancelledError
-            return
+            return False
         if caller_cancelling:
             try:
                 write_task.result()
@@ -737,6 +738,7 @@ class RunJournal(BaseCallbackHandler):
             )
             self._buffer = batch + self._buffer
             raise
+        return True
 
     def _track_detached_write(self, task: asyncio.Future[Any], batch: list[dict]) -> None:
         """Keep ownership of an ambiguous write until its terminal result is known."""
@@ -1030,10 +1032,12 @@ class RunJournal(BaseCallbackHandler):
                 batch = self._buffer[: self._flush_threshold]
                 del self._buffer[: self._flush_threshold]
                 try:
-                    await self._put_batch_cancellation_safe(batch)
+                    settled = await self._put_batch_cancellation_safe(batch)
                 except Exception:
                     self._buffer = batch + self._buffer
                     raise
+                if not settled:
+                    break
                 if settle_predecessors and (self._detached_write_tasks or self._pending_flush_tasks):
                     break
 
@@ -1046,27 +1050,50 @@ class RunJournal(BaseCallbackHandler):
             if progress_task is None:
                 return
             if self._pending_progress_delayed and not progress_task.done():
-                progress_task.cancel()
+                self._cancel_and_retain_progress_task(progress_task)
                 await asyncio.gather(progress_task, return_exceptions=True)
-                self._progress_dirty = False
-                self._pending_progress_delayed = False
                 if self._pending_progress_task is progress_task:
                     self._pending_progress_task = None
+                    self._pending_progress_delayed = False
+                    self._progress_dirty = False
+                    return
+                # Completion may have installed a replacement task; inspect
+                # its state instead of clearing shared progress metadata.
+                continue
             elif not progress_task.done():
                 # A progress snapshot write that is in flight (not merely
                 # delayed) is observed through the same bounded drain deadline
                 # so a hung store cannot block the worker's final flush.
-                done, _ = await asyncio.wait(
-                    {asyncio.shield(progress_task)},
-                    timeout=_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
-                )
+                try:
+                    done, _ = await asyncio.wait(
+                        {asyncio.shield(progress_task)},
+                        timeout=_CANCELLATION_DRAIN_TIMEOUT_SECONDS,
+                    )
+                except asyncio.CancelledError:
+                    self._cancel_and_retain_progress_task(progress_task)
+                    raise
                 if not done:
                     logger.warning(
-                        "Timed out after %.1f seconds waiting for run progress snapshot for run %s; it continues in the background",
+                        "Timed out after %.1f seconds waiting for run progress snapshot for run %s; cancelling it and retaining ownership until cancellation settles",
                         _CANCELLATION_DRAIN_TIMEOUT_SECONDS,
                         self.run_id,
                     )
-                    return
+                    self._cancel_and_retain_progress_task(progress_task)
+                    await asyncio.sleep(0)
+                    if not progress_task.done():
+                        # A reporter may cooperatively delay cancellation. Keep
+                        # the journal-owned reference until that task settles.
+                        return
+                    try:
+                        progress_task.exception()
+                    except asyncio.CancelledError:
+                        pass
+                    if self._pending_progress_task is progress_task:
+                        self._pending_progress_task = None
+                        self._pending_progress_delayed = False
+                        self._progress_dirty = False
+                        return
+                    continue
                 completed = next(iter(done))
                 try:
                     completed.exception()
@@ -1083,7 +1110,28 @@ class RunJournal(BaseCallbackHandler):
             # assuming the task observed above is still current.
             await asyncio.sleep(0)
             if self._pending_progress_task is progress_task:
+                self._pending_progress_task = None
+                self._pending_progress_delayed = False
+                self._progress_dirty = False
                 return
+
+    def _on_progress_task_done(self, task: asyncio.Future[Any]) -> None:
+        if self._pending_progress_task is not task:
+            return
+        self._pending_progress_task = None
+        self._pending_progress_delayed = False
+        self._progress_dirty = False
+
+    def _cancel_and_retain_progress_task(self, task: asyncio.Future[Any]) -> None:
+        self._retain_cancelling_progress_task(task)
+        task.cancel()
+
+    @staticmethod
+    def _retain_cancelling_progress_task(task: asyncio.Future[Any]) -> None:
+        if task in _cancelling_progress_tasks:
+            return
+        _cancelling_progress_tasks.add(task)
+        task.add_done_callback(_cancelling_progress_tasks.discard)
 
     def _schedule_progress_flush(self) -> None:
         """Best-effort throttled progress snapshot for active run visibility."""
@@ -1104,6 +1152,7 @@ class RunJournal(BaseCallbackHandler):
             return
         self._progress_dirty = False
         self._pending_progress_task = loop.create_task(self._flush_progress_async(snapshot=self.get_completion_data()))
+        self._pending_progress_task.add_done_callback(self._on_progress_task_done)
 
     def _schedule_delayed_progress_flush(self, delay: float) -> None:
         if self._pending_progress_task is not None and not self._pending_progress_task.done():
@@ -1115,6 +1164,7 @@ class RunJournal(BaseCallbackHandler):
         delay = max(0.0, delay)
         self._pending_progress_delayed = delay > 0
         self._pending_progress_task = loop.create_task(self._flush_progress_async(delay=delay))
+        self._pending_progress_task.add_done_callback(self._on_progress_task_done)
 
     async def _flush_progress_async(self, *, snapshot: dict | None = None, delay: float = 0.0) -> None:
         if self._progress_reporter is None:

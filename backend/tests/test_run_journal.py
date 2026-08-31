@@ -972,6 +972,58 @@ class TestBufferFlush:
             if detached:
                 await asyncio.gather(*detached, return_exceptions=True)
 
+    @pytest.mark.anyio
+    async def test_one_flush_keeps_successor_buffered_after_ambiguous_batch(self, monkeypatch):
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+
+        class OrderedStore:
+            def __init__(self):
+                self.calls: list[list[str]] = []
+                self.first_started = asyncio.Event()
+                self.first_finish = asyncio.Event()
+
+            async def put_batch(self, batch):
+                event_types = [event["event_type"] for event in batch]
+                self.calls.append(event_types)
+                if event_types == ["first"] and len(self.calls) == 1:
+                    self.first_started.set()
+                    await self.first_finish.wait()
+                    raise RuntimeError("late predecessor failure")
+                return []
+
+        store = OrderedStore()
+        journal = RunJournal("r1", "t1", store, flush_threshold=1)
+        journal._buffer = [
+            {"event_type": "first", "category": "trace"},
+            {"event_type": "second", "category": "trace"},
+        ]
+        flush_task = asyncio.create_task(journal.flush())
+        try:
+            await store.first_started.wait()
+            await asyncio.wait_for(flush_task, timeout=0.2)
+
+            assert store.calls == [["first"]]
+            assert [event["event_type"] for event in journal._buffer] == ["second"]
+            assert len(journal._detached_write_tasks) == 1
+
+            store.first_finish.set()
+            detached = tuple(journal._detached_write_tasks)
+            await asyncio.gather(*detached, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert [event["event_type"] for event in journal._buffer] == ["first", "second"]
+
+            await journal.flush_until_settled()
+            assert store.calls == [["first"], ["first"], ["second"]]
+            assert journal._buffer == []
+        finally:
+            store.first_finish.set()
+            await asyncio.gather(flush_task, return_exceptions=True)
+            detached = tuple(getattr(journal, "_detached_write_tasks", ()))
+            if detached:
+                await asyncio.gather(*detached, return_exceptions=True)
+
 
 class TestIdentifyCaller:
     def test_lead_agent_tag(self, journal_setup):
@@ -1666,6 +1718,61 @@ class TestProgressSnapshots:
                 await asyncio.gather(progress_task, return_exceptions=True)
 
     @pytest.mark.anyio
+    async def test_delayed_progress_cleanup_does_not_clear_replacement_state(self, monkeypatch):
+        import asyncio as asyncio_module
+
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+        replacement_installed = asyncio.Event()
+        wait_calls = 0
+
+        async def reporter(_snapshot):
+            await asyncio.Future()
+
+        journal = RunJournal(
+            "r1",
+            "t1",
+            MemoryRunEventStore(),
+            flush_threshold=100,
+            progress_reporter=reporter,
+            progress_flush_interval=10,
+        )
+        journal._schedule_delayed_progress_flush(10)
+        old_task = journal._pending_progress_task
+        assert old_task is not None
+
+        def install_replacement(_completed):
+            journal._progress_dirty = True
+            journal._schedule_delayed_progress_flush(10)
+            replacement_installed.set()
+
+        old_task.add_done_callback(install_replacement)
+        original_wait = asyncio_module.wait
+
+        async def observing_wait(*args, **kwargs):
+            nonlocal wait_calls
+            wait_calls += 1
+            return await original_wait(*args, **kwargs)
+
+        monkeypatch.setattr(journal_module.asyncio, "wait", observing_wait)
+
+        try:
+            await journal.flush()
+            await replacement_installed.wait()
+            assert wait_calls == 0
+            assert journal._pending_progress_task is None
+            assert journal._pending_progress_delayed is False
+            assert journal._progress_dirty is False
+        finally:
+            current = journal._pending_progress_task
+            if current is not None and not current.done():
+                current.cancel()
+            await asyncio.gather(old_task, return_exceptions=True)
+            if current is not None:
+                await asyncio.gather(current, return_exceptions=True)
+
+    @pytest.mark.anyio
     async def test_flush_bounds_hung_progress_reporter_and_still_writes_buffer(self, monkeypatch):
         import deerflow.runtime.journal as journal_module
 
@@ -1712,6 +1819,272 @@ class TestProgressSnapshots:
             reporter.finish.set()
             store.gate.set()
             await asyncio.sleep(0)
+
+    @pytest.mark.anyio
+    async def test_flush_discards_hung_progress_after_bounded_observation(self, monkeypatch):
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+        reporter_started = asyncio.Event()
+        reporter_gate = asyncio.Event()
+
+        async def reporter(_snapshot):
+            reporter_started.set()
+            await reporter_gate.wait()
+
+        journal = RunJournal(
+            "r1",
+            "t1",
+            MemoryRunEventStore(),
+            flush_threshold=100,
+            progress_reporter=reporter,
+            progress_flush_interval=0,
+        )
+        journal._schedule_progress_flush()
+        await reporter_started.wait()
+        progress_task = journal._pending_progress_task
+        assert progress_task is not None
+
+        try:
+            await asyncio.wait_for(journal.flush(), timeout=0.2)
+            await asyncio.sleep(0)
+            assert progress_task.done()
+            assert journal._pending_progress_task is None
+        finally:
+            reporter_gate.set()
+            progress_task = journal._pending_progress_task
+            if progress_task is not None and not progress_task.done():
+                progress_task.cancel()
+            if progress_task is not None:
+                await asyncio.gather(progress_task, return_exceptions=True)
+
+    @pytest.mark.anyio
+    async def test_flush_keeps_progress_task_owned_until_cancellation_settles(self, monkeypatch):
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+        reporter_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release_cancellation = asyncio.Event()
+
+        async def reporter(_snapshot):
+            reporter_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release_cancellation.wait()
+                raise
+
+        journal = RunJournal(
+            "r1",
+            "t1",
+            MemoryRunEventStore(),
+            flush_threshold=100,
+            progress_reporter=reporter,
+            progress_flush_interval=0,
+        )
+        journal._schedule_progress_flush()
+        await reporter_started.wait()
+        progress_task = journal._pending_progress_task
+        assert progress_task is not None
+
+        try:
+            await asyncio.wait_for(journal.flush(), timeout=0.2)
+            await cancellation_seen.wait()
+            assert not progress_task.done()
+            assert journal._pending_progress_task is progress_task
+
+            release_cancellation.set()
+            await asyncio.gather(progress_task, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert progress_task.done()
+            assert journal._pending_progress_task is None
+        finally:
+            release_cancellation.set()
+            if not progress_task.done():
+                progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
+
+    @pytest.mark.anyio
+    async def test_cancelling_progress_task_has_external_strong_root(self, monkeypatch):
+        import gc
+        import weakref
+
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+        reporter_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+
+        async def reporter(_snapshot):
+            reporter_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await asyncio.Future()
+
+        journal = RunJournal(
+            "r1",
+            "t1",
+            MemoryRunEventStore(),
+            flush_threshold=100,
+            progress_reporter=reporter,
+            progress_flush_interval=0,
+        )
+        journal._schedule_progress_flush()
+        await reporter_started.wait()
+        progress_task = journal._pending_progress_task
+        assert progress_task is not None
+        task_ref = weakref.ref(progress_task)
+        journal_ref = weakref.ref(journal)
+
+        try:
+            await asyncio.wait_for(journal.flush(), timeout=0.2)
+            await cancellation_seen.wait()
+            assert not progress_task.done()
+
+            del progress_task
+            del journal
+            gc.collect()
+
+            survivor = task_ref()
+            assert survivor is not None
+            assert journal_ref() is not None
+            assert survivor in journal_module._cancelling_progress_tasks
+
+            survivor.cancel()
+            await asyncio.gather(survivor, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert survivor not in journal_module._cancelling_progress_tasks
+        finally:
+            survivor = task_ref()
+            if survivor is not None and not survivor.done():
+                survivor.cancel()
+            if survivor is not None:
+                await asyncio.gather(survivor, return_exceptions=True)
+
+    @pytest.mark.anyio
+    async def test_progress_timeout_transfers_ownership_before_flush_cancellation(self, monkeypatch):
+        import gc
+        import weakref
+
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.01, raising=False)
+        reporter_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        flush_task: asyncio.Task | None = None
+
+        async def reporter(_snapshot):
+            nonlocal flush_task
+            reporter_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                assert flush_task is not None
+                flush_task.cancel("cancel during progress ownership transfer")
+                await asyncio.Future()
+
+        journal = RunJournal(
+            "r1",
+            "t1",
+            MemoryRunEventStore(),
+            flush_threshold=100,
+            progress_reporter=reporter,
+            progress_flush_interval=0,
+        )
+        journal._schedule_progress_flush()
+        await reporter_started.wait()
+        progress_task = journal._pending_progress_task
+        assert progress_task is not None
+        task_ref = weakref.ref(progress_task)
+
+        flush_task = asyncio.create_task(journal.flush())
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await flush_task
+            await cancellation_seen.wait()
+            assert not progress_task.done()
+
+            del progress_task
+            del journal
+            gc.collect()
+
+            survivor = task_ref()
+            assert survivor is not None
+            assert survivor in journal_module._cancelling_progress_tasks
+
+            survivor.cancel()
+            await asyncio.gather(survivor, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert survivor not in journal_module._cancelling_progress_tasks
+        finally:
+            survivor = task_ref()
+            if survivor is not None and not survivor.done():
+                survivor.cancel()
+            if survivor is not None:
+                await asyncio.gather(survivor, return_exceptions=True)
+
+    @pytest.mark.anyio
+    async def test_progress_observation_cancellation_transfers_ownership(self, monkeypatch):
+        import asyncio as asyncio_module
+
+        import deerflow.runtime.journal as journal_module
+
+        monkeypatch.setattr(journal_module, "_CANCELLATION_DRAIN_TIMEOUT_SECONDS", 0.1, raising=False)
+        reporter_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+
+        async def reporter(_snapshot):
+            reporter_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await asyncio.Future()
+
+        journal = RunJournal(
+            "r1",
+            "t1",
+            MemoryRunEventStore(),
+            flush_threshold=100,
+            progress_reporter=reporter,
+            progress_flush_interval=0,
+        )
+        journal._schedule_progress_flush()
+        await reporter_started.wait()
+        progress_task = journal._pending_progress_task
+        assert progress_task is not None
+        wait_started = asyncio.Event()
+        original_wait = asyncio_module.wait
+
+        async def observing_wait(*args, **kwargs):
+            wait_started.set()
+            return await original_wait(*args, **kwargs)
+
+        monkeypatch.setattr(journal_module.asyncio, "wait", observing_wait)
+        flush_task = asyncio.create_task(journal.flush())
+        try:
+            await wait_started.wait()
+            flush_task.cancel("caller cancellation during progress observation")
+            with pytest.raises(asyncio.CancelledError):
+                await flush_task
+
+            await cancellation_seen.wait()
+            assert not progress_task.done()
+            assert progress_task in journal_module._cancelling_progress_tasks
+
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert progress_task not in journal_module._cancelling_progress_tasks
+        finally:
+            if not progress_task.done():
+                progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
 
 
 class TestChatModelStartHumanMessage:

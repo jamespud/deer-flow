@@ -181,14 +181,22 @@ class McpTaskService:
         ordinary: bool,
         action: str,
     ) -> None:
-        task.add_done_callback(
-            lambda completed: self._observe_batch_release_task(
+        def finalize(completed: asyncio.Future[Any]) -> None:
+            self._observe_batch_release_task(
                 state,
                 completed,
                 ordinary=ordinary,
                 action=action,
             )
-        )
+
+        task.add_done_callback(finalize)
+
+    def _retain_batch_release_task(self, task: asyncio.Future[Any]) -> None:
+        """Transfer a timed-out ordinary release to service ownership."""
+        if task in self._compensation_tasks:
+            return
+        self._compensation_tasks.add(task)
+        task.add_done_callback(self._compensation_tasks.discard)
 
     async def _release_ordinary_batch_record(
         self,
@@ -254,6 +262,7 @@ class McpTaskService:
             # The release is still in flight past the drain deadline on the
             # uncancelled path; it stays tracked by the batch state and settles
             # in the background instead of blocking the poller.
+            self._retain_batch_release_task(task)
             self._observe_batch_release_task(state, task, ordinary=True, action=action)
             logger.warning(
                 "Timed out after %.1f seconds waiting for MCP task release; it continues in the background (%s, task_id=%s)",
