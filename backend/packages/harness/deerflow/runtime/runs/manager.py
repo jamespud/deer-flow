@@ -353,18 +353,31 @@ class RunManager:
         task.add_done_callback(finalize)
 
     async def _wait_for_cancellation_cleanup_state_change(self, *, deadline: float) -> bool:
-        """Wait for producer or cleanup ownership to change until *deadline*."""
+        """Wait for producer or cleanup ownership to change until *deadline*.
+
+        ``_cancellation_cleanup_state_changed`` is only a wakeup hint, not the
+        predicate itself. It is cleared against a race where a producer releases
+        (or a cancellation cleanup is tracked) between the shutdown loop's
+        producer check and this clear: the signal has already been delivered, so
+        skipping the re-read would leave the caller waiting until the deadline
+        with no further event. After clearing we must re-read the real predicate,
+        exactly as ``Event``-as-hint pattern requires.
+        """
         loop = asyncio.get_running_loop()
         remaining = deadline - loop.time()
         if remaining <= 0:
             return False
         self._cancellation_cleanup_state_changed.clear()
+        # Re-read the real state after the clear: if the producer set emptied or a
+        # cancellation cleanup task was tracked in the lost-wakeup window, the
+        # shutdown loop must re-examine owned tasks instead of waiting.
+        if not self._cancellation_cleanup_producers or any(not task.done() for task in self._cancellation_cleanup_tasks):
+            return True
         try:
             async with asyncio.timeout(remaining):
                 await self._cancellation_cleanup_state_changed.wait()
         except TimeoutError:
             return False
-        self._cancellation_cleanup_state_changed.clear()
         return True
 
     async def _drain_cancellation_cleanup(

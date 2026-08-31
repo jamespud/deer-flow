@@ -2698,3 +2698,35 @@ async def test_failed_create_or_reject_unindexes_run():
         await manager.create_or_reject("thread-a", multitask_strategy="reject")
     assert manager._runs == {}
     assert "thread-a" not in manager._runs_by_thread
+
+
+@pytest.mark.anyio
+async def test_shutdown_no_lost_wakeup_when_producer_releases_during_state_wait(monkeypatch):
+    """A producer that releases between the drain predicate check and the wakeup
+    clear must not strand shutdown until its full deadline (lost wakeup)."""
+    manager = RunManager()
+    release_producer = manager._begin_cancellation_cleanup_producer()
+
+    event = manager._cancellation_cleanup_state_changed
+    real_clear = event.clear
+    real_wait = event.wait
+    await_reached = asyncio.Event()
+
+    async def fail_if_awaited(*args, **kwargs):
+        await_reached.set()
+        return await real_wait(*args, **kwargs)
+
+    def release_then_clear() -> None:
+        # Force the race: the producer releases (setting the event) in the window
+        # between the shutdown loop's producer check and the wait helper's clear.
+        release_producer()
+        real_clear()
+
+    monkeypatch.setattr(event, "clear", release_then_clear)
+    monkeypatch.setattr(event, "wait", fail_if_awaited)
+
+    await manager.shutdown(timeout=0.2)
+
+    # The predicate re-read after clear must short-circuit before any wait on the
+    # wakeup event; reaching the wait means the lost-wakeup signal was swallowed.
+    assert not await_reached.is_set(), "shutdown waited on a lost cleanup wakeup"

@@ -1352,7 +1352,32 @@ async def run_agent(
                 run_id=run_id,
             )
             deadline = asyncio.get_running_loop().time() + _FINALIZATION_DRAIN_TIMEOUT_SECONDS
-            finalization_completed = await wait_for_task_until(finalization_result, deadline=deadline)
+            finalization_completed = False
+            try:
+                # Do NOT absorb caller cancellation here. ``finalization_task`` is
+                # owned by RunManager, so the worker can let its own cancellation
+                # propagate while the ordered journal/receipt flush continues in the
+                # background. ``wait_for_task_until`` (which swallows repeated
+                # CancelledError) is only correct inside an ``except CancelledError``
+                # compensation block, not for this foreground wait.
+                done, _pending = await asyncio.wait(
+                    {finalization_result},
+                    timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+                )
+                finalization_completed = finalization_result in done
+            except asyncio.CancelledError:
+                # The worker is being aborted. Release the outcome gate so a
+                # background reconciliation triggered by a late receipt failure is
+                # not stranded, and treat the abandoned foreground wait like a drain
+                # timeout so it attempts the narrow durable CAS. No foreground
+                # terminal persistence runs after this cancellation escapes the
+                # worker's finally block, so release the terminal-status barrier
+                # too: retained reconciliation must not wait forever for a signal
+                # that will never arrive.
+                finalization_timed_out = True
+                finalization_outcome_released.set()
+                terminal_status_settled.set()
+                raise
             if finalization_completed and not finalization_result.cancelled():
                 finalization_outcome_released.set()
                 try:
