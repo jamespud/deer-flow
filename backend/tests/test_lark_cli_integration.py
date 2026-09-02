@@ -5,6 +5,7 @@ import inspect
 import io
 import json
 import multiprocessing
+import os
 import re
 import shutil
 import stat
@@ -1055,6 +1056,7 @@ def test_lark_cli_env_from_runtime_exposes_settings_auth_to_lark_commands(monkey
     assert env["LARKSUITE_CLI_DATA_DIR"].endswith("users/alice/integrations/lark-cli/data")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits unavailable")
 def test_lark_cli_env_hardens_existing_credential_tree(monkeypatch, tmp_path) -> None:
     _patch_paths(monkeypatch, tmp_path / "home")
     config_dir = lark_cli.lark_cli_config_dir("alice")
@@ -1077,6 +1079,116 @@ def test_lark_cli_env_hardens_existing_credential_tree(monkeypatch, tmp_path) ->
     assert stat.S_IMODE(data_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(secret_file.stat().st_mode) == 0o600
     assert stat.S_IMODE(token_file.stat().st_mode) == 0o600
+
+
+def test_windows_credential_tree_hardening_uses_icacls(monkeypatch, tmp_path) -> None:
+    """On Windows the credential tree must be hardened via private icacls ACLs."""
+    _patch_paths(monkeypatch, tmp_path / "home")
+    monkeypatch.setattr(lark_cli, "os", SimpleNamespace(name="nt"))
+
+    config_dir = lark_cli.lark_cli_config_dir("alice")
+    data_dir = lark_cli.lark_cli_data_dir("alice")
+    credential_root = config_dir.parent
+    config_dir.mkdir(parents=True)
+    data_dir.mkdir(parents=True)
+    secret_file = config_dir / "config.json"
+    token_file = data_dir / "auth.json"
+    secret_file.write_text('{"appSecret":"secret"}', encoding="utf-8")
+    token_file.write_text('{"token":"secret"}', encoding="utf-8")
+
+    sid = "S-1-5-21-111-222-333-1001"
+    calls: list[list[str]] = []
+
+    def _fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args and args[0] == "whoami":
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=f'"DOMAIN\\alice","{sid}"\n',
+                stderr="",
+            )
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(lark_cli.subprocess, "run", _fake_run)
+
+    lark_cli.ensure_lark_cli_credential_tree("alice")
+
+    whoami_calls = [args for args in calls if args and args[0] == "whoami"]
+    assert whoami_calls == [["whoami", "/user", "/fo", "csv", "/nh"]]
+
+    icacls_calls = [args for args in calls if args and args[0] == "icacls"]
+    assert icacls_calls, "expected icacls calls on Windows"
+
+    for args in icacls_calls:
+        assert "/inheritance:r" in args
+        assert "/remove:g" in args
+        assert args[-3:] == ["*S-1-1-0", "*S-1-5-11", "*S-1-5-32-545"]
+
+    # Existing-tree handling: every entry (root + each descendant directory and
+    # file) must be repaired, not merely "icacls was invoked somewhere".
+    expected_paths = {
+        str(credential_root),
+        str(config_dir),
+        str(config_dir / "locks"),
+        str(data_dir),
+        str(secret_file),
+        str(token_file),
+    }
+    assert {args[1] for args in icacls_calls} == expected_paths
+
+    dir_paths = {args[1] for args in icacls_calls if args[4].endswith(":(OI)(CI)F")}
+    file_paths = {args[1] for args in icacls_calls if args[4].endswith(":F") and not args[4].endswith("(OI)(CI)F")}
+    assert dir_paths == {str(credential_root), str(config_dir), str(config_dir / "locks"), str(data_dir)}
+    assert file_paths == {str(secret_file), str(token_file)}
+    assert all(args[4] == f"*{sid}:(OI)(CI)F" for args in icacls_calls if args[1] in dir_paths)
+    assert all(args[4] == f"*{sid}:F" for args in icacls_calls if args[1] in file_paths)
+
+
+def test_resolve_current_user_sid_parses_real_whoami_csv_shape(monkeypatch) -> None:
+    """`whoami /user` reports 'User Name, SID'; the SID is the *second* CSV field."""
+    sid = "S-1-5-21-111-222-333-1001"
+
+    def _fake_run(args, **kwargs):
+        assert args[:4] == ["whoami", "/user", "/fo", "csv"]
+        return subprocess.CompletedProcess(
+            args=args,
+            returncode=0,
+            stdout=f'"DOMAIN\\alice","{sid}"\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(lark_cli.subprocess, "run", _fake_run)
+
+    assert lark_cli._resolve_current_user_sid() == sid
+
+
+@pytest.mark.parametrize("fail_kind", ["whoami", "icacls"])
+def test_windows_credential_tree_fails_closed_on_identity_or_acl_failure(monkeypatch, tmp_path, fail_kind) -> None:
+    """Identity or ACL manipulation failures must never silently skip hardening."""
+    _patch_paths(monkeypatch, tmp_path / "home")
+    monkeypatch.setattr(lark_cli, "os", SimpleNamespace(name="nt"))
+
+    config_dir = lark_cli.lark_cli_config_dir("alice")
+    data_dir = lark_cli.lark_cli_data_dir("alice")
+    config_dir.mkdir(parents=True)
+    data_dir.mkdir(parents=True)
+    (config_dir / "config.json").write_text("x", encoding="utf-8")
+    (data_dir / "auth.json").write_text("x", encoding="utf-8")
+
+    def _fake_run(args, **kwargs):
+        if args and args[0] == "whoami":
+            if fail_kind == "whoami":
+                return subprocess.CompletedProcess(args, returncode=1, stdout="", stderr="no user")
+            return subprocess.CompletedProcess(args, returncode=0, stdout='"DOMAIN\\alice","S-1-5-21-1-2-3-4"\n', stderr="")
+        if args and args[0] == "icacls" and fail_kind == "icacls":
+            return subprocess.CompletedProcess(args, returncode=1, stdout="", stderr="access denied")
+        return subprocess.CompletedProcess(args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(lark_cli.subprocess, "run", _fake_run)
+
+    with pytest.raises(RuntimeError):
+        lark_cli.ensure_lark_cli_credential_tree("alice")
 
 
 def test_lark_cli_env_rejects_symlinks_in_credential_tree(monkeypatch, tmp_path) -> None:

@@ -43,6 +43,7 @@ diverge.
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import io
 import json
@@ -298,31 +299,115 @@ def _lark_cli_credential_root(user_id: str) -> Path:
 
 
 def ensure_lark_cli_credential_tree(user_id: str, *, paths: Paths | None = None) -> None:
-    """Make the user's secret-bearing Lark CLI tree owner-only.
+    """Harden access to the user's secret-bearing Lark CLI credential tree.
 
     The CLI writes plaintext app secrets and OAuth tokens beneath this tree.
-    Reject links before changing modes so a compromised tree cannot redirect a
-    chmod or subsequent CLI write outside the user's integration directory.
+    Reject links before changing modes so a compromised tree cannot redirect an
+    ACL change or subsequent CLI write outside the user's integration directory.
     """
     paths = paths or get_paths()
     root = paths.user_dir(user_id) / "integrations" / INTEGRATION_ID
     if root.is_symlink():
         raise ValueError(f"Lark CLI credential path must not be a symlink: {root}")
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    root.chmod(0o700)
     for required in (root / "config", root / "config" / "locks", root / "data"):
         if required.is_symlink():
             raise ValueError(f"Lark CLI credential path must not be a symlink: {required}")
         required.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for path in root.rglob("*"):
-        if path.is_symlink():
-            raise ValueError(f"Lark CLI credential path must not be a symlink: {path}")
+    _apply_lark_cli_credential_tree_permissions(root)
+
+
+def _apply_lark_cli_credential_tree_permissions(root: Path) -> None:
+    """Restrict access on the secret-bearing Lark CLI tree per platform.
+
+    POSIX: directories ``0o700``, files ``0o600``.
+
+    Windows: disable inherited ACLs, grant the Gateway process user Full
+    Control, and remove broad non-administrative grants (Everyone, Authenticated
+    Users, Users). SYSTEM and local Administrators are not explicitly removed;
+    whether they remain after inheritance is disabled depends on whether they
+    were explicit ACEs. Identity or ACL failures raise so we never silently
+    leave the tree accessible.
+    """
+    if os.name == "nt":
+        _harden_windows_credential_tree(root)
+    else:
+        _harden_posix_credential_tree(root)
+
+
+def _harden_posix_credential_tree(root: Path) -> None:
+    for path in (root, *root.rglob("*")):
+        _reject_lark_credential_tree_path(path)
         if path.is_dir():
             path.chmod(0o700)
         elif path.is_file():
             path.chmod(0o600)
-        else:
-            raise ValueError(f"Unsupported file type in Lark CLI credential tree: {path}")
+
+
+def _harden_windows_credential_tree(root: Path) -> None:
+    owner_sid = _resolve_current_user_sid()
+    for path in (root, *root.rglob("*")):
+        _reject_lark_credential_tree_path(path)
+        if path.is_dir():
+            _run_icacls_private(path, owner_sid, inheritable_full=True)
+        elif path.is_file():
+            _run_icacls_private(path, owner_sid, inheritable_full=False)
+
+
+def _reject_lark_credential_tree_path(path: Path) -> None:
+    if path.is_symlink():
+        raise ValueError(f"Lark CLI credential path must not be a symlink: {path}")
+    if not (path.is_dir() or path.is_file()):
+        raise ValueError(f"Unsupported file type in Lark CLI credential tree: {path}")
+
+
+def _resolve_current_user_sid() -> str:
+    """Return the current process user's Windows SID, e.g. ``S-1-5-21-...``.
+
+    ``whoami /user /fo csv /nh`` prints ``"<domain>\\<user>","<sid>"`` — the SID
+    is the *second* CSV field — so we parse it with ``csv.reader`` rather than
+    guessing a field position. SIDs are locale/display-name independent and
+    match the SID-based removal of broad principals below.
+    """
+    result = subprocess.run(
+        ["whoami", "/user", "/fo", "csv", "/nh"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"failed to resolve current Windows user SID: {result.stderr.strip() or result.stdout.strip()}")
+    try:
+        fields = next(csv.reader([result.stdout.strip()]))
+    except (csv.Error, StopIteration) as exc:
+        raise RuntimeError(f"unexpected whoami /user output: {result.stdout.strip()!r}") from exc
+    if len(fields) < 2 or not fields[1].startswith("S-"):
+        raise RuntimeError(f"unexpected whoami /user output: {result.stdout.strip()!r}")
+    return fields[1]
+
+
+def _run_icacls_private(path: Path, owner_sid: str, *, inheritable_full: bool) -> None:
+    """Apply the Windows private-credential ACL policy to *path*.
+
+    Disables inherited ACEs, grants ``*<owner_sid>`` Full Control (inheritable
+    ``(OI)(CI)`` on directories, plain on files), and removes broad
+    non-administrative grants. Raises on any failure (fail closed).
+    """
+    access = "(OI)(CI)F" if inheritable_full else "F"
+    args = [
+        "icacls",
+        str(path),
+        "/inheritance:r",
+        "/grant:r",
+        f"*{owner_sid}:{access}",
+        "/remove:g",
+        "*S-1-1-0",  # Everyone
+        "*S-1-5-11",  # Authenticated Users
+        "*S-1-5-32-545",  # BUILTIN\Users
+    ]
+    result = subprocess.run(args, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"icacls failed to harden {path} (exit {result.returncode}): {result.stderr.strip()}")
 
 
 def lark_cli_managed_gateway_dir() -> Path:
