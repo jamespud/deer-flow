@@ -312,6 +312,18 @@ class TestRunRepository:
         await _cleanup()
 
     @pytest.mark.anyio
+    async def test_mark_delivery_receipt_failed_only_corrects_success(self, tmp_path):
+        repo = await _make_repo(tmp_path)
+        await repo.put("success-run", thread_id="t1", status="success")
+
+        assert await repo.mark_delivery_receipt_failed("success-run", error="receipt missing") is True
+        row = await repo.get("success-run")
+        assert row["status"] == "error"
+        assert row["error"] == "receipt missing"
+        assert await repo.mark_delivery_receipt_failed("success-run", error="late retry") is False
+        await _cleanup()
+
+    @pytest.mark.anyio
     async def test_metadata_preserved(self, tmp_path):
         repo = await _make_repo(tmp_path)
         await repo.put("r1", thread_id="t1", metadata={"key": "value"})
