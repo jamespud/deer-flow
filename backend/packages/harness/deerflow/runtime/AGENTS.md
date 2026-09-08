@@ -175,6 +175,34 @@ post-terminal write must satisfy these four invariants, and any change to
    fences the worker out of the terminal write path, leaving receipt recovery to
    the peer that claimed the run.
 
+**Terminal precedence is first-committed-wins, not latest-writer-wins.** A
+terminal outcome (success, error, or interrupted) is committed by the durable
+CAS in `finalize_if_not_cancelled`, which updates a row only while it is still
+`pending`/`running` and has no recorded `cancel_action`. Once any terminal
+outcome lands, a later `set_status_if_not_cancelled` no-ops (it cannot
+resurrect or overwrite the row), and a cancellation arriving after a committed
+success is likewise a no-op. The single cross-outcome mutation is the narrow
+success→error correction in `mark_delivery_receipt_failed`, which is guarded on
+the row still being `success` and therefore can never overwrite a peer's
+`error`/`interrupted` or revive a cancelled row. There is no unconditional
+priority between success and cancelled: the first CAS to commit wins, and the
+only deterministic downgrade is the success-guarded delivery correction.
+
+**Background finalization has no timer-cancel reaper by design.** A task in
+`_background_finalization_tasks` is strongly retained until it settles
+(success/failure/cancellation), and its `finalize` done-callback removes it
+exactly once. `RunManager.shutdown(timeout=...)` observes these tasks only
+within its caller-provided absolute budget and deliberately never cancels them
+— cancelling a mid-commit journal/receipt write risks duplicating an ambiguous
+write, which is the exact failure this follow-up removes. A permanently hung
+task is bounded in production by the storage layer, not by a second timer:
+Postgres applies `command_timeout=30` (`POSTGRES_COMMAND_TIMEOUT_SECONDS`),
+`_persist_delivery_receipt` retries on a short bounded schedule, and the journal
+flush is bounded by its own drain deadline. When that bounded call eventually
+raises, the supervised task settles and is released. Do not add a forced-cancel
+reaper around these tasks; extend the per-store timeout if a backend truly
+hangs.
+
 Tests: `tests/test_run_worker_delivery.py` pins the worker ordering, timeout,
 downgrade, and cancellation behavior; `tests/test_run_manager.py` pins the
 manager cancellation-cleanup, shutdown, lock-waiter, and late-reconcile
