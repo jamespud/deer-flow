@@ -148,6 +148,15 @@ class MemoryRunStore(RunStore):
         run["updated_at"] = datetime.now(UTC).isoformat()
         return True
 
+    async def mark_delivery_receipt_failed(self, run_id: str, *, error: str) -> bool:
+        run = self._runs.get(run_id)
+        if run is None or run.get("status") != "success":
+            return False
+        run["status"] = "error"
+        run["error"] = error
+        run["updated_at"] = datetime.now(UTC).isoformat()
+        return True
+
     async def start_run(self, run_id) -> bool:
         run = self._runs.get(run_id)
         if run is None or run["status"] != "pending":

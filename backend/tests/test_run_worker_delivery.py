@@ -193,7 +193,7 @@ async def test_ordered_finalization_does_not_overtake_hung_journal_write(monkeyp
         store.release_journal.set()
         if pipeline is not None:
             await asyncio.gather(pipeline, return_exceptions=True)
-        pending_writes = tuple(journal._pending_flush_tasks) + tuple(journal._detached_write_tasks)
+        pending_writes = tuple(journal._pending_flush_tasks)
         if pending_writes:
             await asyncio.gather(*pending_writes, return_exceptions=True)
 

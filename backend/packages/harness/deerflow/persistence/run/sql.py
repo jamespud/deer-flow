@@ -254,6 +254,13 @@ class RunRepository(RunStore):
             await session.commit()
             return result.rowcount != 0
 
+    async def mark_delivery_receipt_failed(self, run_id: str, *, error: str) -> bool:
+        """Correct a success only when the delivery receipt failure is confirmed."""
+        async with self._sf() as session:
+            result = await session.execute(update(RunRow).where(RunRow.run_id == run_id, RunRow.status == "success").values(status="error", error=error, updated_at=datetime.now(UTC)))
+            await session.commit()
+            return result.rowcount != 0
+
     async def start_run(self, run_id: str) -> bool:
         """Start only a still-pending run; cancelled rows must not be resurrected."""
         async with self._sf() as session:

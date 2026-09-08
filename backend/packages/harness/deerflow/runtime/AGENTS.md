@@ -140,6 +140,47 @@ the number of required IDs, whichever is larger; missing exact runs use targeted
 
 **Terminal run cleanup explicitly breaks graph-scoped references while preserving the existing `RunRecord` grace period.** Every `agent.astream()` iterator is closed in `_stream_once`, including abort/exception/early-break paths. A close failure after an abort is warning-only and cannot replace the user-requested `interrupted` outcome; normal-completion close failures still surface, and an in-flight stream exception remains authoritative over a secondary close failure. Journal construction and cancellable preflight work (including MCP task projection and the prior-finalization wait) live inside the worker's guarded body, so cancellation before agent startup still terminalizes the run and closes its stream. `run_agent()` wraps the complete terminal-finalization sequence in an outer teardown guard, so cancellation or failure from any terminal-stage await cannot skip `RunJournal.close()`, removal of the journal, `__pregel_runtime`, and internal runtime-context values from every runnable config, or release of local graph/payload references. That guard schedules bridge cleanup, run-record cleanup, and cyclic GC even when interruption happens before the terminal stream marker or terminal publication itself fails, so neither a cancelled observer nor a delivery-backend outage can strand process-local run state. `RunJournal.flush()` clears its `_pending_progress_task` after awaiting or cancelling it; ordinary `close()` detaches the event store/progress reporter and clears callback bookkeeping only after that flush succeeds, preserving the buffer for retry on a transient store failure. A fenced worker instead calls `close(flush=False)`, which cancels pending journal work and detaches without initiating another event-store write after lease ownership is lost; its final detach runs even if a second cancellation interrupts pending-task shutdown. `RunManager.cleanup(run_id)` retains the process-local `RunRecord`, completed task, and request payload for its default 300-second local join/status window before releasing them. Durable history remains in `RunStore`; `StreamBridge` data keeps its separate 60-second late-subscriber window, and both cleanup coroutines run in a fresh empty `contextvars.Context`. A contextless full cyclic-GC pass, coalesced to at most once every 10 seconds and dispatched through the default executor, bounds the lifetime of unreachable LangGraph callback/loop cycles without synchronously walking the heap in the event-loop timer; passes taking at least 100 ms are logged at INFO because CPython GC may still impose interpreter-level pauses.
 
+### Run finalization ownership invariants
+
+The worker and `RunManager` jointly own run finalization. Every terminal or
+post-terminal write must satisfy these four invariants, and any change to
+`runtime/runs/worker.py` or `runtime/runs/manager.py` must keep them in force.
+
+1. **In-flight operation owner.** The ordered journal-flush + delivery-receipt
+   pipeline is one `finalization_task` registered with
+   `RunManager.track_background_finalization`. The worker owns the bounded
+   foreground wait; `RunManager` owns the retained task after timeout or
+   cancellation. Only the owner may observe the eventual success, failure, or
+   cancellation, and it observes that outcome exactly once.
+2. **Deadline behavior.** `_FINALIZATION_DRAIN_TIMEOUT_SECONDS` (5s) bounds the
+   worker's foreground wait; `_LIFECYCLE_CLOSE_TIMEOUT_SECONDS` (5s) bounds the
+   cancelled-lifecycle close. On a timeout the exact task is never cancelled —
+   it stays supervised in the background and later finalization stages proceed.
+   `RunManager.shutdown(timeout=...)` observes the same owner only within its
+   caller-provided absolute deadline and never cancels it merely because the
+   shutdown budget expired.
+3. **Allowed terminal outcomes.** A produced-output run is downgraded to
+   `error` only when finalization is *confirmed* to have failed: a completed
+   exception or an explicit `False` receipt. A timeout leaves the worker's real
+   success outcome intact while the retained task settles. A confirmed late
+   failure applies a success-to-error correction only through the
+   `RunManager.mark_delivery_receipt_failed` success-guarded store operation,
+   which never overwrites a peer's terminal status.
+4. **Durable stale-work fence.** The `run.delivery` receipt is a run-scoped
+   idempotent write and is attempted only after the journal flush returns
+   (never ahead of an unresolved flush). `terminal_status_settled` is released
+   from a `finally` covering finalizing-progress, duration, terminal-status,
+   and completion writes, so cancellation in any intermediate await cannot
+   strand the retained reconciliation task. Lease ownership loss (`ownership_lost`)
+   fences the worker out of the terminal write path, leaving receipt recovery to
+   the peer that claimed the run.
+
+Tests: `tests/test_run_worker_delivery.py` pins the worker ordering, timeout,
+downgrade, and cancellation behavior; `tests/test_run_manager.py` pins the
+manager cancellation-cleanup, shutdown, lock-waiter, and late-reconcile
+ownership; `tests/test_run_repository.py::test_mark_delivery_receipt_failed_only_corrects_success`
+pins the success-guarded store correction.
+
 **Where things live**:
 - `runtime/checkpoint_mode.py` — mode + snapshot-frequency freeze, marker injection, delta detection, compatibility gate, both error types
 - `runtime/checkpoint_state.py` — `CheckpointStateAccessor`, `build_state_mutation_graph`, `RollbackPoint`
