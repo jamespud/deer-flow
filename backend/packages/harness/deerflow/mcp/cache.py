@@ -314,7 +314,7 @@ def _revision_matches_applied_baseline(revision: _McpIncomingRevision) -> bool:
 
 
 def _full_reset_plan() -> _McpReconciliationPlan:
-    """The conservative whole-pool reset plan."""
+    """The conservative deployment-domain reset plan."""
     return _McpReconciliationPlan(
         transition=_McpCacheTransition(frozenset(), None),
         incoming=None,
@@ -343,7 +343,7 @@ def _classify_against_applied(incoming: _McpIncomingRevision) -> _McpReconciliat
     incoming_connections = incoming.connections
 
     if incoming.interceptors != _mcp_applied_interceptors:
-        logger.info("MCP interceptors changed; the whole MCP session pool must be reset")
+        logger.info("MCP interceptors changed; deployment MCP sessions must be retired")
         return _McpReconciliationPlan(
             transition=_McpCacheTransition(frozenset(), None),
             incoming=incoming,
@@ -587,6 +587,8 @@ def _apply_reconciliation_locked(plan: _McpReconciliationPlan) -> _PendingTeardo
     ``pool._lock`` (and off the event loop when one is running).
     """
     from deerflow.mcp.session_pool import get_session_pool
+
+    incoming = plan.incoming
 
     if plan.reconcile_existing_only:
         pool = get_session_pool()
@@ -904,7 +906,10 @@ def refresh_mcp_cache_if_active() -> bool:
     retired = False
     with _init_condition:
         if not _cache_initialized and _initializing_generation is None and _mcp_applied_servers is None:
-            return False
+            from deerflow.mcp.session_pool import get_session_pool
+
+            if not get_session_pool().has_any_binding(domain="deployment"):
+                return False
         plan = _plan_cache_transition(fence_in_flight_initialization=True)
         if plan is not None:
             pending_teardown = _apply_reconciliation_locked(plan)

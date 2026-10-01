@@ -1355,3 +1355,23 @@ def test_baseline_less_delete_tombstones_existing_deployment_binding(cache_globa
     assert current.fingerprint is None
     assert current != binding
     assert _entry(pool, "A", owner_loop) is None
+
+
+def test_refresh_reconciles_cold_residual_binding_without_published_baseline(cache_globals, monkeypatch, tmp_path):
+    """The no-server refresh path must still fence residual deployment state."""
+    cfg = tmp_path / "extensions_config.json"
+    _write_config(cfg, {})
+    monkeypatch.setenv("DEER_FLOW_EXTENSIONS_CONFIG_PATH", str(cfg))
+
+    pool = get_session_pool()
+    old = pool.ensure_binding(
+        "A",
+        normalized_connection_fingerprint({"transport": "stdio", "command": "npx", "args": []}),
+        domain="deployment",
+    )
+
+    assert cache_module.refresh_mcp_cache_if_active() is True
+    current = pool.active_binding("A", domain="deployment")
+    assert current is not None
+    assert current.fingerprint is None
+    assert current != old
