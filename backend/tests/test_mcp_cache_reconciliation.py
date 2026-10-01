@@ -1322,3 +1322,36 @@ def test_baseline_less_deployment_reconciliation_preserves_personal_binding(cach
 
     assert pool.active_binding("same-name", domain="personal") == personal
     assert _entry(pool, "same-name", owner_loop, domain="personal")[0] is session
+
+
+def test_baseline_less_delete_tombstones_existing_deployment_binding(cache_globals, monkeypatch, tmp_path, owner_loop):
+    """A pre-baseline delete fences an already-held deployment session."""
+    cfg = tmp_path / "extensions_config.json"
+    _write_config(cfg, {"A": _stdio("npx")})
+    monkeypatch.setenv("DEER_FLOW_EXTENSIONS_CONFIG_PATH", str(cfg))
+
+    pool = get_session_pool()
+    connection = {"transport": "stdio", "command": "npx", "args": []}
+    binding = pool.ensure_binding(
+        "A",
+        normalized_connection_fingerprint(connection),
+        domain="deployment",
+    )
+    owner_loop.run_until_complete(
+        pool.get_session(
+            "A",
+            "thread-1",
+            connection,
+            binding=binding,
+            domain="deployment",
+        )
+    )
+    assert _entry(pool, "A", owner_loop) is not None
+
+    mcp_router._apply_mcp_server_delete("A")
+
+    current = pool.active_binding("A", domain="deployment")
+    assert current is not None
+    assert current.fingerprint is None
+    assert current != binding
+    assert _entry(pool, "A", owner_loop) is None

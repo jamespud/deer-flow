@@ -501,23 +501,10 @@ class MCPSessionPool:
         caller, and those are pool state, not cache state -- so they must be
         compared against the incoming connections instead of being ignored.
 
-        Unlike :meth:`reconcile_bindings` this neither seeds a name the pool has
-        not seen nor tombstones one that is absent from *active*: only the
-        *intersection* of ``active`` with the bindings already held is corrected.
-        A binding whose fingerprint changed is re-bound (fresh epoch, owner
-        detached); an unchanged fingerprint -- or a name outside this
-        reconciler's domain -- is left completely untouched.
-
-        Skipping the removal case is deliberate. Without an applied baseline the
-        deployment pool can only observably hold two kinds of binding: one left
-        by a failed/unpublished discovery (no published wrapper, so nothing needs
-        protecting when the server disappears) and one owned by a deployment
-        durable-task session (whose task-enabled config is frozen, so a removal
-        or connection change is rejected before the write). Names owned by
-        another domain -- the personal MCP servers that share this pool -- must
-        never be tombstoned here, because their runtime name is stable and a
-        tombstone would fence them permanently instead of letting discovery
-        re-resolve them.
+        Unlike :meth:`reconcile_bindings` this never seeds a name the pool has
+        not seen. Existing bindings in *domain* are compared with ``active``:
+        changed connections are re-bound and names no longer present are
+        tombstoned. Bindings in every other ownership domain are untouched.
 
         Detach and close-signal happen in one ``_lock`` critical section, so a
         caller cancelled before it awaits the returned teardown cannot strand an
@@ -536,6 +523,19 @@ class MCPSessionPool:
                     continue  # Not seeded here, or unchanged: never touched.
                 self._install_binding_locked(resource, fingerprint)
                 changed.append(resource)
+
+            # With ownership domains, an absent deployment name is
+            # unambiguously a removed deployment resource; personal resources
+            # with the same runtime name live under a different key.
+            for resource, current in list(self._bindings.items()):
+                if resource.domain != domain or resource.server_name in active:
+                    continue
+                if current.fingerprint is None:
+                    continue
+                self._binding_lifecycle_servers.add(resource)
+                self._install_binding_locked(resource, None)
+                changed.append(resource)
+
             for resource in changed:
                 for entry_key in [k for k in self._entries if k[0] == resource]:
                     entries.append(self._entries.pop(entry_key))
