@@ -1078,3 +1078,40 @@ async def test_personal_task_call_resolves_in_the_personal_domain(monkeypatch, t
     assert personal_binding.fingerprint != deployment_binding.fingerprint
     # ...and the deployment binding for the colliding name is untouched.
     assert pool.active_binding(runtime_name) == deployment_binding
+
+
+@pytest.mark.asyncio
+async def test_personal_stdio_task_call_uses_personal_pool_domain() -> None:
+    result = SimpleNamespace(structuredContent={"task_id": "remote-1", "status": "running"}, isError=False)
+    session = SimpleNamespace(call_tool=AsyncMock(return_value=result))
+    binding = ServerBinding(MCPPoolResource(domain="personal", server_name="reports"), 1, "fp")
+    pool = MagicMock()
+    pool.ensure_binding = MagicMock(return_value=binding)
+    pool.get_session = AsyncMock(return_value=session)
+
+    caller = McpTaskToolCaller(ExtensionsConfig())
+    personal_caller = McpTaskToolCaller(_config())
+
+    with (
+        patch.object(caller, "_personal_caller_for", return_value=personal_caller),
+        patch("deerflow.mcp.task_tool_caller.require_personal_mcp_access", new_callable=AsyncMock),
+        patch("deerflow.mcp.task_tool_caller.get_session_pool", return_value=pool),
+        patch(
+            "deerflow.mcp.task_tool_caller._prepare_stdio_connection",
+            return_value={"transport": "stdio", "command": "report-mcp"},
+        ),
+    ):
+        actual = await caller.call_tool(
+            server_name="reports",
+            tool_name="status_report",
+            arguments={"task_id": "remote-1"},
+            user_id="user-1",
+            thread_id="thread-1",
+            connection_scope="personal",
+        )
+
+    assert actual is result
+    assert pool.ensure_binding.call_args.kwargs["domain"] == "personal"
+    pool.get_session.assert_awaited_once()
+    assert pool.get_session.await_args.kwargs["binding"] == binding
+    session.call_tool.assert_awaited_once_with("status_report", {"task_id": "remote-1"})

@@ -166,3 +166,82 @@ async def test_unprefixed_stdio_tool_keeps_server_like_original_name(tmp_path: P
         await wrapped.coroutine(query="repositories")
 
     mock_session.call_tool.assert_awaited_once_with("github_search", {"query": "repositories"})
+
+
+@pytest.mark.asyncio
+async def test_personal_discovery_routes_stdio_wrapper_to_personal_pool_domain() -> None:
+    extensions_config = ExtensionsConfig.model_validate(
+        {
+            "mcpServers": {
+                "github": {
+                    "type": "stdio",
+                    "command": "uvx",
+                    "args": ["github-mcp"],
+                }
+            }
+        }
+    )
+    servers_config = {
+        "github": {
+            "transport": "stdio",
+            "command": "uvx",
+            "args": ["github-mcp"],
+        }
+    }
+    binding = ServerBinding(MCPPoolResource(domain="personal", server_name="github"), 1, "fp")
+    pool = MagicMock()
+    pool.ensure_binding = MagicMock(return_value=binding)
+
+    class FakeClient:
+        def __init__(self, _connections, *, callbacks=None, tool_interceptors=None, **_kwargs) -> None:
+            self.callbacks = callbacks
+            self.tool_interceptors = tool_interceptors or []
+
+        async def get_tools(self, *, server_name=None):
+            assert server_name == "github"
+            return [_tool("github_search")]
+
+    with (
+        patch("deerflow.mcp.user_config.load_user_mcp_config", return_value=extensions_config),
+        patch("deerflow.mcp.personal_access.authorized_personal_config", new_callable=AsyncMock, return_value=extensions_config),
+        patch("deerflow.mcp.tools.build_servers_config", return_value=servers_config),
+        patch("deerflow.mcp.tools.get_initial_oauth_headers", new_callable=AsyncMock, return_value={}),
+        patch("deerflow.mcp.tools.build_mcp_tool_interceptors", return_value=[]),
+        patch("deerflow.mcp.tools.get_session_pool", return_value=pool),
+        patch("langchain_mcp_adapters.client.MultiServerMCPClient", FakeClient),
+        patch("deerflow.mcp.tools._make_session_pool_tool", side_effect=lambda tool, *_args, **_kwargs: tool) as wrap_tool,
+    ):
+        tools = await get_mcp_tools(extensions_config, personal_user_id="alice")
+
+    assert [tool.name for tool in tools] == ["github_search"]
+    wrap_tool.assert_called_once()
+    assert wrap_tool.call_args.kwargs["binding"].resource.domain == "personal"
+
+
+@pytest.mark.asyncio
+async def test_personal_stdio_wrapper_uses_personal_pool_domain(tmp_path: Path) -> None:
+    original_tool = _tool("github_search")
+    mock_session = AsyncMock()
+    mock_session.call_tool = AsyncMock(return_value=MagicMock(content=[], isError=False, structuredContent=None))
+    mock_pool = MagicMock()
+    mock_pool.get_session = AsyncMock(return_value=mock_session)
+    binding = ServerBinding(MCPPoolResource(domain="personal", server_name="github"), 1, "fp")
+
+    with (
+        patch("deerflow.mcp.tools.get_paths", return_value=MagicMock()),
+        patch(
+            "deerflow.mcp.tools._prepare_stdio_workspace",
+            return_value=(tmp_path, tmp_path / "tmp", {}),
+        ),
+    ):
+        wrapped = _make_session_pool_tool(
+            original_tool,
+            "github",
+            {"transport": "stdio", "command": "mcp-server", "args": []},
+            pool=mock_pool,
+            binding=binding,
+        )
+        await wrapped.coroutine(query="repositories")
+
+    assert mock_pool.get_session.await_args.kwargs["binding"] == binding
+    mock_session.call_tool.assert_awaited_once_with("github_search", {"query": "repositories"})

@@ -3405,3 +3405,97 @@ async def test_close_thread_scope_spans_domains_without_retiring_bindings():
     # Scope teardown must never retire or advance a resource binding.
     assert pool.active_binding("same") == deployment
     assert pool.active_binding("same", domain="personal") == personal
+
+
+@pytest.mark.asyncio
+async def test_same_server_and_scope_are_isolated_by_ownership_domain():
+    """Deployment and personal resources never share or retire each other's session."""
+    pool = MCPSessionPool()
+    cms = []
+
+    class Cm:
+        def __init__(self):
+            self.session = AsyncMock()
+            self.closed = False
+
+        async def __aenter__(self):
+            return self.session
+
+        async def __aexit__(self, *_args):
+            self.closed = True
+            return False
+
+    def make_cm(*_args, **_kwargs):
+        cm = Cm()
+        cms.append(cm)
+        return cm
+
+    connection = {"transport": "stdio", "command": "x", "args": []}
+    with patch("langchain_mcp_adapters.sessions.create_session", side_effect=make_cm):
+        deployment = await pool.get_session("server", "thread-1", connection)
+        personal = await pool.get_session("server", "thread-1", connection, domain="personal")
+
+        assert deployment is not personal
+        assert await pool.get_session("server", "thread-1", connection) is deployment
+        assert await pool.get_session("server", "thread-1", connection, domain="personal") is personal
+
+        await pool.close_session("server", "thread-1")
+        assert cms[0].closed is True
+        assert cms[1].closed is False
+        assert await pool.get_session("server", "thread-1", connection, domain="personal") is personal
+
+        await pool.close_all()
+
+    assert cms[1].closed is True
+
+
+@pytest.mark.asyncio
+async def test_personal_disconnect_evicts_only_personal_domain():
+    """A dead personal session cannot evict the same-named deployment session."""
+    pool = MCPSessionPool()
+    deployment = AsyncMock()
+    personal = AsyncMock()
+    deployment.initialize = AsyncMock()
+    personal.initialize = AsyncMock()
+    personal.call_tool = AsyncMock(side_effect=anyio.ClosedResourceError())
+    closed = {"deployment": False, "personal": False}
+
+    class Cm:
+        def __init__(self, session, name):
+            self.session = session
+            self.name = name
+
+        async def __aenter__(self):
+            return self.session
+
+        async def __aexit__(self, *_args):
+            closed[self.name] = True
+            return False
+
+    connection = {"transport": "stdio", "command": "x", "args": []}
+    with patch(
+        "langchain_mcp_adapters.sessions.create_session",
+        side_effect=[Cm(deployment, "deployment"), Cm(personal, "personal")],
+    ):
+        assert await pool.get_session("server", "thread-1", connection) is deployment
+        assert await pool.get_session("server", "thread-1", connection, domain="personal") is personal
+
+        with pytest.raises(anyio.ClosedResourceError):
+            await call_pooled_session_tool(
+                personal,
+                pool,
+                server_name="server",
+                scope_key="thread-1",
+                tool_name="probe",
+                arguments={},
+                call_kwargs={},
+                domain="personal",
+            )
+
+        assert closed == {"deployment": False, "personal": True}
+        assert await pool.get_session("server", "thread-1", connection) is deployment
+        assert (_res("server", "personal"), "thread-1", asyncio.get_running_loop()) not in pool._entries
+
+        await pool.close_all()
+
+    assert closed == {"deployment": True, "personal": True}
