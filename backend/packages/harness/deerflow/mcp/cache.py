@@ -785,25 +785,37 @@ async def initialize_mcp_tools() -> list[BaseTool]:
         try:
             if _cache_generation != claim_generation:
                 logger.info("MCP cache was reset during initialization; discarding stale result")
-                return []
-
-            publish = loaded_snapshot is not None and post_snapshot is not None and loaded_snapshot == post_snapshot
-            if not publish:
-                logger.warning("MCP config changed during initialization; discarding stale result")
-                discard_teardown = _reset_mcp_tools_cache_state_and_retire_pool_locked()
+                # A first initialization can be superseded before get_mcp_tools()
+                # reaches its synchronous pre-discovery binding pass. In that
+                # ordering the writer bumps the cache generation while the pool
+                # is still empty, then the stale discovery can seed an old
+                # deployment binding afterwards. The result is never published,
+                # but leaving that residual binding would make a direct
+                # initialize_mcp_tools() retry fail its binding fence. Reconcile
+                # only baseline-less deployment bindings against the current
+                # config before releasing the generation claim.
+                if _mcp_applied_servers is None:
+                    residual_plan = _baseline_less_reconciliation_plan()
+                    if residual_plan is not None:
+                        discard_teardown = _apply_reconciliation_locked(residual_plan)
             else:
-                _mcp_tools_cache = loaded_tools
-                _cache_initialized = True
-                _config_path, _config_signature = post_path, post_sig
-                _mcp_config_snapshot = post_snapshot
-                _initialized_without_config = post_path is None
-                # Publishing a fresh revision also makes it the pool-applied
-                # baseline: discovery seeded/validated every stdio binding
-                # against exactly this revision.
-                if post_revision is not None:
-                    _record_applied_revision(post_revision)
-                logger.info("MCP tools initialized: %d tool(s) loaded (config path: %s)", len(_mcp_tools_cache), _config_path)
-                return _mcp_tools_cache
+                publish = loaded_snapshot is not None and post_snapshot is not None and loaded_snapshot == post_snapshot
+                if not publish:
+                    logger.warning("MCP config changed during initialization; discarding stale result")
+                    discard_teardown = _reset_mcp_tools_cache_state_and_retire_pool_locked()
+                else:
+                    _mcp_tools_cache = loaded_tools
+                    _cache_initialized = True
+                    _config_path, _config_signature = post_path, post_sig
+                    _mcp_config_snapshot = post_snapshot
+                    _initialized_without_config = post_path is None
+                    # Publishing a fresh revision also makes it the pool-applied
+                    # baseline: discovery seeded/validated every stdio binding
+                    # against exactly this revision.
+                    if post_revision is not None:
+                        _record_applied_revision(post_revision)
+                    logger.info("MCP tools initialized: %d tool(s) loaded (config path: %s)", len(_mcp_tools_cache), _config_path)
+                    return _mcp_tools_cache
         finally:
             if _initializing_generation == claim_generation:
                 _initializing_generation = None

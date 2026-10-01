@@ -642,6 +642,53 @@ def test_reconcile_during_first_initialization_fences_stale_publish(cache_global
     assert get_session_pool().active_binding("A") is None
 
 
+def test_superseded_first_initialization_repairs_binding_seeded_after_fence(cache_globals, monkeypatch, tmp_path):
+    """A stale first discovery cannot leave a late-seeded binding behind."""
+    cfg = tmp_path / "extensions_config.json"
+    _write_config(cfg, {"A": _stdio("npx")})
+    monkeypatch.setenv("DEER_FLOW_EXTENSIONS_CONFIG_PATH", str(cfg))
+
+    pool = get_session_pool()
+    discovery_entered = threading.Event()
+    release_discovery = threading.Event()
+
+    async def _late_seed_get_mcp_tools(*, extensions_config):
+        discovery_entered.set()
+        await asyncio.to_thread(release_discovery.wait)
+        params = build_server_params("A", extensions_config.mcp_servers["A"])
+        pool.ensure_binding(
+            "A",
+            normalized_connection_fingerprint(params),
+            domain="deployment",
+        )
+        return ["stale-tools"]
+
+    monkeypatch.setattr("deerflow.mcp.tools.get_mcp_tools", _late_seed_get_mcp_tools)
+
+    async def _run() -> list:
+        owner = asyncio.create_task(cache_module.initialize_mcp_tools())
+        assert await asyncio.to_thread(discovery_entered.wait, 2)
+        assert pool.active_binding("A", domain="deployment") is None
+
+        _write_config(cfg, {"A": _stdio("uvx")})
+        assert cache_module.reconcile_mcp_servers({"A"}) is True
+        assert pool.active_binding("A", domain="deployment") is None
+
+        release_discovery.set()
+        return await asyncio.wait_for(owner, timeout=2)
+
+    assert asyncio.run(_run()) == []
+    current = pool.active_binding("A", domain="deployment")
+    assert current is not None
+    assert current.fingerprint == normalized_connection_fingerprint(_connection("uvx"))
+
+    # The repaired residual must permit a direct retry, not only the lazy cache
+    # path that would run another reconciliation pass first.
+    _install_discovery(monkeypatch)
+    assert asyncio.run(cache_module.initialize_mcp_tools()) == ["A:uvx"]
+    assert cache_module._cache_initialized is True
+
+
 # ---------------------------------------------------------------------------
 # Apply paths
 # ---------------------------------------------------------------------------
