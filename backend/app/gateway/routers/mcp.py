@@ -27,7 +27,12 @@ from deerflow.config.extensions_config import (
 )
 from deerflow.config.runtime_paths import project_root
 from deerflow.constants import DEFAULT_MCP_SESSION_INIT_TIMEOUT
-from deerflow.mcp.cache import reset_mcp_tools_cache
+from deerflow.mcp.cache import (
+    effective_server_config,
+    finish_mcp_reconciliation,
+    prepare_mcp_reconciliation,
+    reset_mcp_tools_cache,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["mcp"])
@@ -1198,14 +1203,15 @@ def _validate_extensions_config_candidate(raw_data: dict, *, check_installation_
         _raise_invalid_mcp_configuration("Duplicate MCP installation IDs; remove conflicting entries or assign unique capability IDs in the deployment configuration")
 
 
-def _apply_mcp_config_update(body: McpConfigUpdateRequest) -> dict:
+def _apply_mcp_config_update(body: McpConfigUpdateRequest) -> tuple[dict, set[str] | None]:
     """Worker-thread body for :func:`update_mcp_configuration`.
 
     Resolving the config path, the existence probe, reading the raw JSON,
     writing the merged config, and reloading it are all blocking filesystem IO
     that must stay off the event loop. The merge is pure in-memory work but
     lives here too so the whole read-modify-write is a single worker hop.
-    Returns the reloaded MCP server configs for the response.
+    Returns the reloaded MCP server configs for the response and ``None`` to ask
+    the reconciler to classify the complete on-disk replacement itself.
     """
     # Resolve before entering the critical section so every writer locks the
     # same sidecar path for the complete read-modify-write cycle.
@@ -1214,6 +1220,7 @@ def _apply_mcp_config_update(body: McpConfigUpdateRequest) -> dict:
         config_path = project_root() / "extensions_config.json"
         logger.info(f"No existing extensions config found. Creating new config at: {config_path}")
 
+    pending_reconciliation = None
     with extensions_config_write_lock, extensions_config_file_lock(config_path):
         # Load raw (un-resolved) JSON from disk to use as the merge source.
         # This preserves $VAR placeholders in env values and top-level keys
@@ -1260,10 +1267,13 @@ def _apply_mcp_config_update(body: McpConfigUpdateRequest) -> dict:
         # agent runtime lives in Gateway, so this keeps API reads and tool
         # execution aligned after extensions_config.json changes.
         reload_extensions_config()
-        return _mcp_server_responses_from_raw(config_data)
+        pending_reconciliation = prepare_mcp_reconciliation(None)
+        payload = _mcp_server_responses_from_raw(config_data)
+    finish_mcp_reconciliation(pending_reconciliation)
+    return payload, None
 
 
-def _apply_mcp_server_state_update(body: McpServerStateUpdateRequest) -> dict:
+def _apply_mcp_server_state_update(body: McpServerStateUpdateRequest) -> tuple[dict, set[str]]:
     """Update one server state while preserving the raw extensions config."""
     config_path = ExtensionsConfig.resolve_config_path()
     if config_path is None:
@@ -1272,6 +1282,7 @@ def _apply_mcp_server_state_update(body: McpServerStateUpdateRequest) -> dict:
             detail=f"MCP server '{body.server_name}' not found",
         )
 
+    pending_reconciliation = None
     with extensions_config_write_lock, extensions_config_file_lock(config_path):
         if not config_path.exists():
             raise HTTPException(
@@ -1296,13 +1307,18 @@ def _apply_mcp_server_state_update(body: McpServerStateUpdateRequest) -> dict:
                 )
             )
 
+        enabled_changed = target_server.enabled != body.enabled
         raw_server["enabled"] = body.enabled
         _validate_extensions_config_candidate(raw_data)
         atomic_write_extensions_config(config_path, raw_data)
 
         logger.info("MCP server %s enabled state updated to %s", body.server_name, body.enabled)
         reload_extensions_config()
-        return _mcp_server_responses_from_raw(raw_data)
+        changed = {body.server_name} if enabled_changed else set()
+        pending_reconciliation = prepare_mcp_reconciliation(changed)
+        payload = _mcp_server_responses_from_raw(raw_data)
+    finish_mcp_reconciliation(pending_reconciliation)
+    return payload, changed
 
 
 def _mcp_config_path(*, create: bool) -> Path:
@@ -1364,9 +1380,10 @@ def _ensure_skills_key(raw_data: dict) -> None:
     raw_data["skills"] = {name: {"enabled": skill.enabled} for name, skill in current_config.skills.items()}
 
 
-def _apply_mcp_servers_create(body: McpConfigUpdateRequest) -> dict:
+def _apply_mcp_servers_create(body: McpConfigUpdateRequest) -> tuple[dict, set[str]]:
     """Atomically add servers without replacing entries already on disk."""
     config_path = _mcp_config_path(create=True)
+    pending_reconciliation = None
     with extensions_config_write_lock, extensions_config_file_lock(config_path):
         raw_data = _load_raw_extensions_config(config_path, create=True)
         raw_servers = _raw_mcp_servers(raw_data)
@@ -1377,9 +1394,11 @@ def _apply_mcp_servers_create(body: McpConfigUpdateRequest) -> dict:
                 detail=f"MCP server '{duplicate}' already exists",
             )
 
+        existing_names = set(raw_servers)
         for name, incoming in body.mcp_servers.items():
             _ensure_no_masked_secrets(incoming)
             raw_servers[name] = incoming.model_dump()
+        added_names = set(raw_servers) - existing_names
         raw_data["mcpServers"] = raw_servers
         _ensure_skills_key(raw_data)
         _validate_extensions_config_candidate(raw_data)
@@ -1387,12 +1406,16 @@ def _apply_mcp_servers_create(body: McpConfigUpdateRequest) -> dict:
 
         logger.info("Added MCP servers: %s", ", ".join(body.mcp_servers))
         reload_extensions_config()
-        return _mcp_server_responses_from_raw(raw_data)
+        pending_reconciliation = prepare_mcp_reconciliation(added_names)
+        payload = _mcp_server_responses_from_raw(raw_data)
+    finish_mcp_reconciliation(pending_reconciliation)
+    return payload, added_names
 
 
-def _apply_mcp_server_config_update(body: McpServerConfigUpdateRequest) -> dict:
+def _apply_mcp_server_config_update(body: McpServerConfigUpdateRequest) -> tuple[dict, set[str]]:
     """Atomically replace one server while preserving concurrent sibling edits."""
     config_path = _mcp_config_path(create=False)
+    pending_reconciliation = None
     with extensions_config_write_lock, extensions_config_file_lock(config_path):
         raw_data = _load_raw_extensions_config(config_path, create=False)
         raw_servers = _raw_mcp_servers(raw_data)
@@ -1409,6 +1432,7 @@ def _apply_mcp_server_config_update(body: McpServerConfigUpdateRequest) -> dict:
             preserve_omitted_fields=False,
         )
         _ensure_no_masked_secrets(merged)
+        config_changed = effective_server_config(existing_server) != effective_server_config(merged)
         raw_servers[body.server_name] = merged.model_dump()
         raw_data["mcpServers"] = raw_servers
         _validate_extensions_config_candidate(raw_data)
@@ -1416,12 +1440,17 @@ def _apply_mcp_server_config_update(body: McpServerConfigUpdateRequest) -> dict:
 
         logger.info("Updated MCP server: %s", body.server_name)
         reload_extensions_config()
-        return _mcp_server_responses_from_raw(raw_data)
+        changed = {body.server_name} if config_changed else set()
+        pending_reconciliation = prepare_mcp_reconciliation(changed)
+        payload = _mcp_server_responses_from_raw(raw_data)
+    finish_mcp_reconciliation(pending_reconciliation)
+    return payload, changed
 
 
-def _apply_mcp_server_delete(server_name: str) -> dict:
+def _apply_mcp_server_delete(server_name: str) -> tuple[dict, set[str]]:
     """Atomically remove one server while preserving every sibling entry."""
     config_path = _mcp_config_path(create=False)
+    pending_reconciliation = None
     with extensions_config_write_lock, extensions_config_file_lock(config_path):
         raw_data = _load_raw_extensions_config(config_path, create=False)
         raw_servers = _raw_mcp_servers(raw_data)
@@ -1440,7 +1469,11 @@ def _apply_mcp_server_delete(server_name: str) -> dict:
 
         logger.info("Deleted MCP server: %s", server_name)
         reload_extensions_config()
-        return _mcp_server_responses_from_raw(raw_data)
+        changed = {server_name}
+        pending_reconciliation = prepare_mcp_reconciliation(changed)
+        payload = _mcp_server_responses_from_raw(raw_data)
+    finish_mcp_reconciliation(pending_reconciliation)
+    return payload, changed
 
 
 @router.post(
@@ -1457,7 +1490,7 @@ async def reset_mcp_tools_cache_endpoint(request: Request) -> McpCacheResetRespo
     and avoids relying on extensions_config.json mtime changes.
     """
     await require_admin_user(request, detail=_ADMIN_REQUIRED_DETAIL)
-    reset_mcp_tools_cache()
+    await asyncio.to_thread(reset_mcp_tools_cache)
     return McpCacheResetResponse(
         success=True,
         message="MCP tools cache reset. Tools will reload on next use.",
@@ -1476,7 +1509,7 @@ async def update_mcp_configuration(request: Request, body: McpConfigUpdateReques
     This will:
     1. Save the new configuration to the mcp_config.json file
     2. Reload the configuration cache
-    3. Reset MCP tools cache to trigger reinitialization
+    3. Reconcile MCP tools and pooled sessions with the committed configuration
 
     Args:
         request: The new MCP configuration to save.
@@ -1511,10 +1544,9 @@ async def update_mcp_configuration(request: Request, body: McpConfigUpdateReques
         # worker takes extensions_config_write_lock for the whole RMW, so it stays
         # atomic and serialized against the skills router (the other writer of
         # this file) even if this request is cancelled mid-write.
-        reloaded_servers = await asyncio.to_thread(_apply_mcp_config_update, body)
+        reloaded_servers, _ = await asyncio.to_thread(_apply_mcp_config_update, body)
 
         servers = {name: _mask_server_config(McpServerConfigResponse(**server.model_dump())) for name, server in reloaded_servers.items()}
-        reset_mcp_tools_cache()
         return McpConfigResponse(mcp_servers=servers)
 
     except HTTPException:
@@ -1535,10 +1567,9 @@ async def create_mcp_servers(request: Request, body: McpConfigUpdateRequest) -> 
     try:
         await require_admin_user(request, detail=_ADMIN_REQUIRED_DETAIL)
         _validate_mcp_update_request(body)
-        reloaded_servers = await asyncio.to_thread(_apply_mcp_servers_create, body)
+        reloaded_servers, _ = await asyncio.to_thread(_apply_mcp_servers_create, body)
 
         servers = {name: _mask_server_config(McpServerConfigResponse(**server.model_dump())) for name, server in reloaded_servers.items()}
-        reset_mcp_tools_cache()
         return McpConfigResponse(mcp_servers=servers)
     except HTTPException:
         raise
@@ -1554,17 +1585,16 @@ async def create_mcp_servers(request: Request, body: McpConfigUpdateRequest) -> 
     description="Replace one MCP server without replacing sibling configurations.",
 )
 async def update_mcp_server(request: Request, body: McpServerConfigUpdateRequest) -> McpConfigResponse:
-    """Update one existing server and reload the MCP tool cache."""
+    """Update one existing server and reconcile the MCP tool/session cache."""
     try:
         await require_admin_user(request, detail=_ADMIN_REQUIRED_DETAIL)
         _validate_mcp_update_request(
             McpConfigUpdateRequest(mcp_servers={body.server_name: body.server}),
             enforce_execution_policy=body.server.enabled,
         )
-        reloaded_servers = await asyncio.to_thread(_apply_mcp_server_config_update, body)
+        reloaded_servers, _ = await asyncio.to_thread(_apply_mcp_server_config_update, body)
 
         servers = {name: _mask_server_config(McpServerConfigResponse(**server.model_dump())) for name, server in reloaded_servers.items()}
-        reset_mcp_tools_cache()
         return McpConfigResponse(mcp_servers=servers)
     except HTTPException:
         raise
@@ -1583,10 +1613,9 @@ async def delete_mcp_server(request: Request, server_name: str) -> McpConfigResp
     """Delete one existing server and reload the MCP tool cache."""
     try:
         await require_admin_user(request, detail=_ADMIN_REQUIRED_DETAIL)
-        reloaded_servers = await asyncio.to_thread(_apply_mcp_server_delete, server_name)
+        reloaded_servers, _ = await asyncio.to_thread(_apply_mcp_server_delete, server_name)
 
         servers = {name: _mask_server_config(McpServerConfigResponse(**server.model_dump())) for name, server in reloaded_servers.items()}
-        reset_mcp_tools_cache()
         return McpConfigResponse(mcp_servers=servers)
     except HTTPException:
         raise
@@ -1605,10 +1634,9 @@ async def update_mcp_server_state(request: Request, body: McpServerStateUpdateRe
     """Enable or disable one MCP server and reload the MCP tool cache."""
     try:
         await require_admin_user(request, detail=_ADMIN_REQUIRED_DETAIL)
-        reloaded_servers = await asyncio.to_thread(_apply_mcp_server_state_update, body)
+        reloaded_servers, _ = await asyncio.to_thread(_apply_mcp_server_state_update, body)
 
         servers = {name: _mask_server_config(McpServerConfigResponse(**server.model_dump())) for name, server in reloaded_servers.items()}
-        reset_mcp_tools_cache()
         return McpConfigResponse(mcp_servers=servers)
     except HTTPException:
         raise

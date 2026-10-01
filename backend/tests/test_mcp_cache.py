@@ -52,6 +52,14 @@ _TRACKED_GLOBALS = (
     "_cache_generation",
     "_mcp_config_snapshot",
     "_initialized_without_config",
+    # PR2 pool-applied baseline: deliberately NOT cleared by
+    # ``_reset_mcp_tools_cache_state()``, so the fixture must isolate it.
+    "_mcp_applied_servers",
+    "_mcp_applied_order",
+    "_mcp_applied_connections",
+    "_mcp_applied_interceptors",
+    "_mcp_applied_path",
+    "_mcp_applied_signature",
 )
 
 
@@ -79,7 +87,19 @@ def cache_globals():
 
     cache_module._mcp_tools_cache = None
     cache_module._cache_initialized = False
-    for name in ("_config_path", "_config_signature", "_config_mtime", "_mcp_config_snapshot", "_initialized_without_config"):
+    for name in (
+        "_config_path",
+        "_config_signature",
+        "_config_mtime",
+        "_mcp_config_snapshot",
+        "_initialized_without_config",
+        "_mcp_applied_servers",
+        "_mcp_applied_order",
+        "_mcp_applied_connections",
+        "_mcp_applied_interceptors",
+        "_mcp_applied_path",
+        "_mcp_applied_signature",
+    ):
         if hasattr(cache_module, name):
             setattr(cache_module, name, None)
     # threading.Lock is safe across threads and does not bind to event loops,
@@ -473,7 +493,7 @@ def test_config_change_during_initialization_discards_stale_tools(cache_globals,
     assert calls == 2
 
 
-def test_config_change_during_initialization_retires_pool_for_same_server_connection_change(cache_globals, monkeypatch, tmp_path):
+def test_config_change_during_initialization_retires_the_deployment_domain(cache_globals, monkeypatch, tmp_path):
     """Discarding a mid-load config change must also retire pooled sessions.
 
     A stale load can create a pooled session before ``initialize_mcp_tools``
@@ -501,6 +521,25 @@ def test_config_change_during_initialization_retires_pool_for_same_server_connec
 
         def close_all_sync(self) -> None:
             self.closed = True
+
+        def retire_all(self) -> None:
+            self.retired = True
+
+        def has_any_binding(self, *, domain=None) -> bool:
+            # No bindings are modelled beyond the sessions this fake records.
+            return bool(self.sessions)
+
+        def reconcile_existing_bindings(self, active, *, domain="deployment"):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(entries=(), inflight=())
+
+        def prepare_retire_all(self, *, domain=None):
+            from types import SimpleNamespace
+
+            self.closed = True
+            self.sessions.clear()
+            return SimpleNamespace(entries=(), inflight=())
 
     real_reset_session_pool = session_pool_module.reset_session_pool
     monkeypatch.setattr(session_pool_module, "MCPSessionPool", FakeSessionPool)
@@ -538,7 +577,9 @@ def test_config_change_during_initialization_retires_pool_for_same_server_connec
 
         assert second == ["session-uvx"]
         assert loaded_pools[0] is old_pool
-        assert loaded_pools[1] is not old_pool
+        # Deployment-domain retirement keeps the pool object; only its
+        # deployment resources are retired.
+        assert loaded_pools[1] is old_pool
         assert loaded_sessions[0] is not loaded_sessions[1]
         assert old_pool.closed is True
         assert cache_module._cache_initialized is True
@@ -583,14 +624,14 @@ def test_reset_mcp_tools_cache_does_not_wait_for_in_flight_initialization(cache_
     assert not reset_thread.is_alive()
 
 
-def test_automatic_stale_invalidation_retires_session_pool_before_reinitializing(cache_globals, monkeypatch, tmp_path):
-    """Automatic config-signature invalidation must retire the old session pool.
+def test_automatic_stale_invalidation_reconciles_without_replacing_the_pool(cache_globals, monkeypatch, tmp_path):
+    """Automatic invalidation reconciles the pool per server (PR2).
 
-    ``get_cached_mcp_tools()`` detects runtime edits through ``_is_cache_stale``
-    without going through the explicit admin reset endpoint. That automatic path
-    must still swap the session-pool singleton before rebuilding tool wrappers;
-    otherwise the fresh wrappers can keep reusing sessions created from the old
-    connection config.
+    ``get_cached_mcp_tools()`` detects runtime edits through the applied-baseline
+    classifier without going through the explicit admin reset endpoint. A server
+    rename must fence only the removed/added names: the pool singleton is kept,
+    and unrelated live sessions are never closed. The cache is still retired so
+    fresh wrappers are rebuilt from the new revision.
     """
     from deerflow.mcp import session_pool as session_pool_module
 
@@ -617,8 +658,11 @@ def test_automatic_stale_invalidation_retires_session_pool_before_reinitializing
         result = cache_module.get_cached_mcp_tools()
 
         assert result == ["new-tools"]
-        assert loaded_pools == [session_pool_module.get_session_pool()]
-        assert loaded_pools[0] is not old_pool
+        # PR2: the pool is NOT replaced; only the changed servers retire.
+        assert loaded_pools == [old_pool]
+        assert session_pool_module.get_session_pool() is old_pool
+        assert old_pool.active_binding("old").fingerprint is None
+        assert old_pool.active_binding("new") is not None
         assert cache_module._cache_initialized is True
     finally:
         real_reset_session_pool()
@@ -704,6 +748,75 @@ def test_cancelled_initializer_releases_generation_claim(cache_globals, monkeypa
     assert cache_module._cache_initialized is True
     assert cache_module._initializing_generation is None
     assert calls == 2
+
+
+def test_concurrent_cold_start_callers_share_first_initialization(cache_globals, monkeypatch, tmp_path):
+    """A read racing the first initializer must wait, not void its work."""
+    cfg = tmp_path / "extensions_config.json"
+    _write_extensions_config(cfg, {"srv1": _server()})
+    monkeypatch.setenv("DEER_FLOW_EXTENSIONS_CONFIG_PATH", str(cfg))
+
+    started = threading.Event()
+    release = threading.Event()
+    second_planning = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+
+    async def _gated_tools(**_kwargs):
+        nonlocal calls
+        with calls_lock:
+            calls += 1
+        started.set()
+        await asyncio.to_thread(release.wait)
+        return ["cold-start-tool"]
+
+    monkeypatch.setattr("deerflow.mcp.tools.get_mcp_tools", _gated_tools)
+
+    real_plan = cache_module._plan_cache_transition
+    plan_calls = 0
+    plan_lock = threading.Lock()
+
+    def _tracked_plan(*args, **kwargs):
+        nonlocal plan_calls
+        with plan_lock:
+            plan_calls += 1
+            if plan_calls == 2:
+                second_planning.set()
+        return real_plan(*args, **kwargs)
+
+    monkeypatch.setattr(cache_module, "_plan_cache_transition", _tracked_plan)
+
+    results: list[list] = []
+    errors: list[BaseException] = []
+    results_lock = threading.Lock()
+
+    def _call() -> None:
+        try:
+            result = cache_module.get_cached_mcp_tools()
+        except BaseException as exc:  # pragma: no cover - surfaced by assertion
+            with results_lock:
+                errors.append(exc)
+        else:
+            with results_lock:
+                results.append(result)
+
+    first = threading.Thread(target=_call, name="cold-start-1")
+    second = threading.Thread(target=_call, name="cold-start-2")
+    first.start()
+    assert started.wait(timeout=2), "first initializer did not reach discovery"
+    second.start()
+    assert second_planning.wait(timeout=2), "second caller did not enter transition planning"
+    release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert calls == 1
+    assert results == [["cold-start-tool"], ["cold-start-tool"]]
+    assert cache_module._cache_initialized is True
+    assert cache_module._mcp_tools_cache == ["cold-start-tool"]
 
 
 # ---------------------------------------------------------------------------
@@ -827,7 +940,12 @@ def test_refresh_is_noop_before_initialization(cache_globals, monkeypatch):
 
 
 def test_refresh_retires_cache_when_last_server_is_disabled(cache_globals, monkeypatch, tmp_path):
-    """Disabling the last server still converges an already-initialized cache."""
+    """Disabling the last server still converges an already-initialized cache.
+
+    PR2: the removal is selective — the server is tombstoned rather than
+    replacing the whole pool — but the cache state must still be retired so the
+    next assembly re-reads the config instead of silently serving stale tools.
+    """
     from deerflow.mcp.session_pool import get_session_pool, reset_session_pool
 
     cfg = tmp_path / "extensions_config.json"
@@ -835,8 +953,6 @@ def test_refresh_retires_cache_when_last_server_is_disabled(cache_globals, monke
     _initialize_against(monkeypatch, cfg)
 
     old_pool = get_session_pool()
-    closed: list[bool] = []
-    monkeypatch.setattr(old_pool, "close_all_sync", lambda: closed.append(True))
     _write_extensions_config(cfg, {})
 
     try:
@@ -844,8 +960,8 @@ def test_refresh_retires_cache_when_last_server_is_disabled(cache_globals, monke
         assert cache_module._cache_initialized is False
         assert cache_module._mcp_tools_cache is None
         assert cache_module._mcp_config_snapshot is None
-        assert get_session_pool() is not old_pool
-        assert closed == [True]
+        assert get_session_pool() is old_pool
+        assert old_pool.active_binding("srv1").fingerprint is None
     finally:
         reset_session_pool()
 
@@ -927,7 +1043,7 @@ def test_initialization_without_a_readable_snapshot_discards_result(cache_global
         return ["loaded-tools"]
 
     monkeypatch.setattr("deerflow.mcp.tools.get_mcp_tools", _fake_get_mcp_tools)
-    monkeypatch.setattr(cache_module, "_read_stable_mcp_snapshot", lambda path, signature: None)
+    monkeypatch.setattr(cache_module, "_read_stable_mcp_revision", lambda path, signature: None)
 
     result = asyncio.run(cache_module.initialize_mcp_tools())
 
@@ -1205,7 +1321,7 @@ def test_unverifiable_signature_is_not_treated_as_stable(cache_globals, monkeypa
     incomplete = _no_digest(cfg)
     assert incomplete is not None and incomplete[2] is None
 
-    assert cache_module._read_stable_mcp_snapshot(cfg, incomplete) is None
+    assert cache_module._read_stable_mcp_revision(cfg, incomplete) is None
     assert cache_module._is_cache_stale() is True
 
 

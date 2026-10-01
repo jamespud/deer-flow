@@ -15,13 +15,27 @@ import pytest
 from mcp.shared.exceptions import McpError
 from mcp.types import CONNECTION_CLOSED, CallToolResult, ErrorData, TextContent
 
-from deerflow.mcp.session_pool import MCPSessionPool, call_pooled_session_tool, get_session_pool, reset_session_pool
+from deerflow.mcp.session_pool import (
+    MCPPoolResource,
+    MCPSessionPool,
+    ServerBinding,
+    call_pooled_session_tool,
+    get_session_pool,
+    normalized_connection_fingerprint,
+    reset_session_pool,
+)
 from deerflow.mcp_scope import (
     THREAD_INCARNATION_METADATA_GUARD_KEY,
     mcp_scope_belongs_to_thread,
     mcp_session_scope_key,
     runtime_thread_incarnation,
 )
+
+
+def _res(name: str, domain: str = "deployment"):
+    """Registry key for one pooled resource (the pool keys on (resource, scope, loop))."""
+
+    return MCPPoolResource(domain=domain, server_name=name)
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +50,16 @@ def _legacy_tool_runtime(*, thread_id: str = "default"):
         context={"thread_id": thread_id, "thread_incarnation": None},
         config={},
     )
+
+
+def _binding_for(server_name: str, connection: dict) -> ServerBinding:
+    """Seed the module pool's binding for a direct wrapper call.
+
+    Mirrors how ``get_mcp_tools`` resolves a server's binding from its BASE
+    connection before discovery: a first-seen name is seeded, an unchanged
+    fingerprint re-resolves idempotently.
+    """
+    return get_session_pool().ensure_binding(server_name, normalized_connection_fingerprint(connection))
 
 
 def test_runtime_incarnation_matches_server_thread_metadata():
@@ -139,100 +163,6 @@ async def test_get_session_reuses_existing():
     assert s1 is s2
     # Only one session should have been created.
     assert mock_cm.__aenter__.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_same_server_and_scope_are_isolated_by_ownership_domain():
-    """Deployment and personal resources must never share or retire each other's session."""
-    pool = MCPSessionPool()
-    cms = []
-
-    class Cm:
-        def __init__(self):
-            self.session = AsyncMock()
-            self.closed = False
-
-        async def __aenter__(self):
-            return self.session
-
-        async def __aexit__(self, *_args):
-            self.closed = True
-            return False
-
-    def make_cm(*_args, **_kwargs):
-        cm = Cm()
-        cms.append(cm)
-        return cm
-
-    connection = {"transport": "stdio", "command": "x", "args": []}
-    with patch("langchain_mcp_adapters.sessions.create_session", side_effect=make_cm):
-        deployment = await pool.get_session("server", "thread-1", connection)
-        personal = await pool.get_session("server", "thread-1", connection, domain="personal")
-
-        assert deployment is not personal
-        assert await pool.get_session("server", "thread-1", connection) is deployment
-        assert await pool.get_session("server", "thread-1", connection, domain="personal") is personal
-
-        await pool.close_session("server", "thread-1")
-        assert cms[0].closed is True
-        assert cms[1].closed is False
-        assert await pool.get_session("server", "thread-1", connection, domain="personal") is personal
-
-        await pool.close_all()
-
-    assert cms[1].closed is True
-
-
-@pytest.mark.asyncio
-async def test_personal_disconnect_evicts_only_personal_domain():
-    """A dead personal session must not evict the same-named deployment session."""
-    pool = MCPSessionPool()
-    deployment = AsyncMock()
-    personal = AsyncMock()
-    deployment.initialize = AsyncMock()
-    personal.initialize = AsyncMock()
-    personal.call_tool = AsyncMock(side_effect=anyio.ClosedResourceError())
-    closed = {"deployment": False, "personal": False}
-
-    class Cm:
-        def __init__(self, session, name):
-            self.session = session
-            self.name = name
-
-        async def __aenter__(self):
-            return self.session
-
-        async def __aexit__(self, *_args):
-            closed[self.name] = True
-            return False
-
-    connection = {"transport": "stdio", "command": "x", "args": []}
-    with patch(
-        "langchain_mcp_adapters.sessions.create_session",
-        side_effect=[Cm(deployment, "deployment"), Cm(personal, "personal")],
-    ):
-        assert await pool.get_session("server", "thread-1", connection) is deployment
-        assert await pool.get_session("server", "thread-1", connection, domain="personal") is personal
-
-        with pytest.raises(anyio.ClosedResourceError):
-            await call_pooled_session_tool(
-                personal,
-                pool,
-                server_name="server",
-                scope_key="thread-1",
-                tool_name="probe",
-                arguments={},
-                call_kwargs={},
-                domain="personal",
-            )
-
-        assert closed == {"deployment": False, "personal": True}
-        assert await pool.get_session("server", "thread-1", connection) is deployment
-        assert ("server", "thread-1", asyncio.get_running_loop(), "personal") not in pool._entries
-
-        await pool.close_all()
-
-    assert closed == {"deployment": True, "personal": True}
 
 
 @pytest.mark.asyncio
@@ -462,7 +392,7 @@ async def test_close_scope():
     assert cms[1].closed is False
 
     # t2 session still exists.
-    assert ("s", "t2") in {k[:2] for k in pool._entries}
+    assert (_res("s"), "t2") in {k[:2] for k in pool._entries}
 
 
 @pytest.mark.asyncio
@@ -511,8 +441,8 @@ async def test_close_thread_scope_closes_every_incarnation_of_one_thread():
     assert cms[3].closed is False, "the same thread id under another user must survive"
 
     remaining = {k[:2] for k in pool._entries}
-    assert ("s", other_thread) in remaining
-    assert ("s", other_user) in remaining
+    assert (_res("s"), other_thread) in remaining
+    assert (_res("s"), other_user) in remaining
     assert not any(mcp_scope_belongs_to_thread(k[1], user_id="u1", thread_id="t1") for k in pool._entries)
 
 
@@ -622,7 +552,7 @@ async def test_close_session_only_evicts_the_exact_server_scope_pair():
     assert cms[0].closed is True
     assert cms[1].closed is False
     assert cms[2].closed is False
-    assert {k[:2] for k in pool._entries} == {("s2", "t1"), ("s1", "t2")}
+    assert {k[:2] for k in pool._entries} == {(_res("s2"), "t1"), (_res("s1"), "t2")}
 
 
 @pytest.mark.asyncio
@@ -708,12 +638,7 @@ def _make_test_pool_tool(*, pool, call_tool, tool_interceptors=None):
     pool.close_session_if_current = AsyncMock()
 
     with patch("deerflow.mcp.tools.get_session_pool", return_value=pool):
-        wrapped = _make_session_pool_tool(
-            original_tool,
-            "srv",
-            {"transport": "stdio", "command": "x", "args": []},
-            tool_interceptors=tool_interceptors,
-        )
+        wrapped = _make_session_pool_tool(original_tool, "srv", {"transport": "stdio", "command": "x", "args": []}, tool_interceptors=tool_interceptors, binding=ServerBinding(_res("srv"), 1, "fp"), pool=pool)
     return wrapped, session
 
 
@@ -767,7 +692,7 @@ mcp.run(transport="stdio")
     runtime.config = {}
 
     with patch("deerflow.mcp.tools.get_paths", return_value=Paths(tmp_path)):
-        wrapped = _make_session_pool_tool(original_tool, "crash", connection)
+        wrapped = _make_session_pool_tool(original_tool, "crash", connection, binding=_binding_for("crash", connection), pool=get_session_pool())
         with pytest.raises(McpError, match="Connection closed") as exc_info:
             await wrapped.coroutine(runtime=runtime)
 
@@ -777,7 +702,7 @@ mcp.run(transport="stdio")
             thread_id="thread",
             thread_incarnation="incarnation-1",
         )
-        assert ("crash", scope_key) not in {k[:2] for k in get_session_pool()._entries}
+        assert (_res("crash"), scope_key) not in {k[:2] for k in get_session_pool()._entries}
 
         content, _artifact = await wrapped.coroutine(runtime=runtime)
 
@@ -806,7 +731,7 @@ async def test_session_pool_tool_evicts_session_after_transport_disconnect(tmp_p
     ):
         await wrapped.coroutine(runtime=_legacy_tool_runtime(), value=1)
 
-    pool.close_session_if_current.assert_awaited_once_with("srv", "test-user-autouse:default", session)
+    pool.close_session_if_current.assert_awaited_once_with("srv", "test-user-autouse:default", session, domain="deployment")
 
 
 @pytest.mark.asyncio
@@ -831,7 +756,7 @@ async def test_session_pool_tool_evicts_connection_closed_through_interceptor(tm
     ):
         await wrapped.coroutine(runtime=_legacy_tool_runtime(), value=1)
 
-    pool.close_session_if_current.assert_awaited_once_with("srv", "test-user-autouse:default", session)
+    pool.close_session_if_current.assert_awaited_once_with("srv", "test-user-autouse:default", session, domain="deployment")
 
 
 @pytest.mark.asyncio
@@ -875,7 +800,7 @@ async def test_session_pool_tool_preserves_disconnect_error_when_eviction_fails(
         await wrapped.coroutine(runtime=_legacy_tool_runtime(), value=1)
 
     assert exc_info.value is error
-    pool.close_session_if_current.assert_awaited_once_with("srv", "test-user-autouse:default", session)
+    pool.close_session_if_current.assert_awaited_once_with("srv", "test-user-autouse:default", session, domain="deployment")
 
 
 @pytest.mark.asyncio
@@ -885,7 +810,7 @@ async def test_session_pool_disconnect_cleanup_survives_caller_cancellation():
     release_cleanup = asyncio.Event()
     cleanup_finished = asyncio.Event()
 
-    async def close_session_if_current(*_args):
+    async def close_session_if_current(*_args, **_kwargs):
         cleanup_started.set()
         await release_cleanup.wait()
         cleanup_finished.set()
@@ -1017,11 +942,7 @@ async def test_late_disconnect_from_old_session_does_not_evict_replacement(tmp_p
         patch("deerflow.mcp.tools.get_paths", return_value=Paths(tmp_path)),
         patch("langchain_mcp_adapters.sessions.create_session", side_effect=create_session),
     ):
-        wrapped = _make_session_pool_tool(
-            original_tool,
-            "srv",
-            {"transport": "stdio", "command": "x", "args": []},
-        )
+        wrapped = _make_session_pool_tool(original_tool, "srv", {"transport": "stdio", "command": "x", "args": []}, binding=_binding_for("srv", {"transport": "stdio", "command": "x", "args": []}), pool=pool)
         runtime = _legacy_tool_runtime()
         first_call = asyncio.create_task(wrapped.coroutine(runtime=runtime, value=1))
         late_call = asyncio.create_task(wrapped.coroutine(runtime=runtime, value=2))
@@ -1036,7 +957,7 @@ async def test_late_disconnect_from_old_session_does_not_evict_replacement(tmp_p
         with pytest.raises(anyio.ClosedResourceError):
             await late_call
 
-    assert pool._entries[("srv", "test-user-autouse:default", asyncio.get_running_loop(), "deployment")][0] is replacement
+    assert pool._entries[(_res("srv"), "test-user-autouse:default", asyncio.get_running_loop())][0] is replacement
     await pool.close_all()
 
 
@@ -1069,7 +990,7 @@ async def test_session_pool_tool_wrapping():
     connection = {"transport": "stdio", "command": "pw", "args": []}
 
     with patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm):
-        wrapped = _make_session_pool_tool(original_tool, "playwright", connection)
+        wrapped = _make_session_pool_tool(original_tool, "playwright", connection, binding=_binding_for("playwright", connection), pool=get_session_pool())
 
         # Simulate a tool call with a runtime context containing thread_id.
         mock_runtime = MagicMock()
@@ -1120,7 +1041,7 @@ async def test_session_pool_tool_pins_cwd_and_temp_env(tmp_path):
         patch("deerflow.mcp.tools.get_paths", return_value=paths),
         patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm) as create_session,
     ):
-        wrapped = _make_session_pool_tool(original_tool, "playwright", connection)
+        wrapped = _make_session_pool_tool(original_tool, "playwright", connection, binding=_binding_for("playwright", connection), pool=get_session_pool())
         await wrapped.coroutine(runtime=mock_runtime, url="https://example.com")
 
     session_connection = create_session.call_args.args[0]
@@ -1176,7 +1097,7 @@ async def test_session_pool_tool_does_not_override_explicit_tmpdir(tmp_path):
         patch("deerflow.mcp.tools.get_paths", return_value=paths),
         patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm) as create_session,
     ):
-        wrapped = _make_session_pool_tool(original_tool, "playwright", connection)
+        wrapped = _make_session_pool_tool(original_tool, "playwright", connection, binding=_binding_for("playwright", connection), pool=get_session_pool())
         await wrapped.coroutine(runtime=mock_runtime, url="https://example.com")
 
     session_connection = create_session.call_args.args[0]
@@ -1223,7 +1144,7 @@ async def test_session_pool_tool_does_not_override_explicit_cwd(tmp_path):
         patch("deerflow.mcp.tools.get_paths", return_value=paths),
         patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm) as create_session,
     ):
-        wrapped = _make_session_pool_tool(original_tool, "playwright", connection)
+        wrapped = _make_session_pool_tool(original_tool, "playwright", connection, binding=_binding_for("playwright", connection), pool=get_session_pool())
         await wrapped.coroutine(runtime=mock_runtime, url="https://example.com")
 
     session_connection = create_session.call_args.args[0]
@@ -1270,7 +1191,7 @@ async def test_session_pool_tool_skips_fs_work_for_non_stdio_transport(tmp_path)
         patch("deerflow.mcp.tools.get_paths", return_value=paths) as get_paths,
         patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm) as create_session,
     ):
-        wrapped = _make_session_pool_tool(original_tool, "srv", connection)
+        wrapped = _make_session_pool_tool(original_tool, "srv", connection, binding=_binding_for("srv", connection), pool=get_session_pool())
         await wrapped.coroutine(runtime=mock_runtime, url="https://example.com")
 
     session_connection = create_session.call_args.args[0]
@@ -1324,7 +1245,7 @@ async def test_session_pool_tool_skips_after_walk_when_no_text_content(tmp_path)
         patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm),
         patch("deerflow.mcp.tools._changed_workspace_files") as changed_files,
     ):
-        wrapped = _make_session_pool_tool(original_tool, "playwright", connection)
+        wrapped = _make_session_pool_tool(original_tool, "playwright", connection, binding=_binding_for("playwright", connection), pool=get_session_pool())
         await wrapped.coroutine(runtime=mock_runtime, url="https://example.com")
 
     changed_files.assert_not_called()
@@ -1370,7 +1291,7 @@ async def test_session_pool_tool_runs_after_walk_when_text_content_present(tmp_p
         patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm),
         patch("deerflow.mcp.tools._changed_workspace_files", return_value=[]) as changed_files,
     ):
-        wrapped = _make_session_pool_tool(original_tool, "playwright", connection)
+        wrapped = _make_session_pool_tool(original_tool, "playwright", connection, binding=_binding_for("playwright", connection), pool=get_session_pool())
         await wrapped.coroutine(runtime=mock_runtime, url="https://example.com")
 
     changed_files.assert_called_once()
@@ -1409,10 +1330,7 @@ async def test_session_pool_tool_forwards_interceptor_headers():
 
     with patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm):
         wrapped = _make_session_pool_tool(
-            original_tool,
-            "srv",
-            {"transport": "stdio", "command": "x", "args": []},
-            tool_interceptors=[header_interceptor],
+            original_tool, "srv", {"transport": "stdio", "command": "x", "args": []}, binding=_binding_for("srv", {"transport": "stdio", "command": "x", "args": []}), tool_interceptors=[header_interceptor], pool=get_session_pool()
         )
         await wrapped.coroutine(runtime=_legacy_tool_runtime(), x=1)
 
@@ -1458,10 +1376,7 @@ async def test_session_pool_interceptor_reads_request_scoped_secret():
         ),
     ):
         wrapped = _make_session_pool_tool(
-            original_tool,
-            "srv",
-            {"transport": "stdio", "command": "x", "args": []},
-            tool_interceptors=[secret_header_interceptor],
+            original_tool, "srv", {"transport": "stdio", "command": "x", "args": []}, binding=_binding_for("srv", {"transport": "stdio", "command": "x", "args": []}), tool_interceptors=[secret_header_interceptor], pool=get_session_pool()
         )
         await wrapped.coroutine(runtime=_legacy_tool_runtime(), x=1)
 
@@ -1504,10 +1419,7 @@ async def test_session_pool_tool_no_headers_omits_meta():
 
     with patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm):
         wrapped = _make_session_pool_tool(
-            original_tool,
-            "srv",
-            {"transport": "stdio", "command": "x", "args": []},
-            tool_interceptors=[passthrough_interceptor],
+            original_tool, "srv", {"transport": "stdio", "command": "x", "args": []}, binding=_binding_for("srv", {"transport": "stdio", "command": "x", "args": []}), tool_interceptors=[passthrough_interceptor], pool=get_session_pool()
         )
         await wrapped.coroutine(runtime=_legacy_tool_runtime(), x=1)
 
@@ -1548,10 +1460,7 @@ async def test_session_pool_tool_ignores_unsupported_header_type(caplog):
 
     with patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm):
         wrapped = _make_session_pool_tool(
-            original_tool,
-            "srv",
-            {"transport": "stdio", "command": "x", "args": []},
-            tool_interceptors=[invalid_header_interceptor],
+            original_tool, "srv", {"transport": "stdio", "command": "x", "args": []}, binding=_binding_for("srv", {"transport": "stdio", "command": "x", "args": []}), tool_interceptors=[invalid_header_interceptor], pool=get_session_pool()
         )
         await wrapped.coroutine(runtime=_legacy_tool_runtime(), x=1)
 
@@ -1585,7 +1494,7 @@ async def test_session_pool_tool_extracts_thread_id():
     mock_cm.__aexit__ = AsyncMock(return_value=False)
 
     with patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm):
-        wrapped = _make_session_pool_tool(original_tool, "server", {"transport": "stdio", "command": "x", "args": []})
+        wrapped = _make_session_pool_tool(original_tool, "server", {"transport": "stdio", "command": "x", "args": []}, binding=_binding_for("server", {"transport": "stdio", "command": "x", "args": []}), pool=get_session_pool())
 
         mock_runtime = MagicMock()
         mock_runtime.context = {"thread_incarnation": "incarnation-1"}
@@ -1601,7 +1510,7 @@ async def test_session_pool_tool_extracts_thread_id():
         thread_id="from-config",
         thread_incarnation="incarnation-1",
     )
-    assert ("server", expected_scope) in {k[:2] for k in pool._entries}
+    assert (_res("server"), expected_scope) in {k[:2] for k in pool._entries}
 
 
 @pytest.mark.asyncio
@@ -1630,13 +1539,13 @@ async def test_session_pool_tool_default_scope():
     mock_cm.__aexit__ = AsyncMock(return_value=False)
 
     with patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm):
-        wrapped = _make_session_pool_tool(original_tool, "server", {"transport": "stdio", "command": "x", "args": []})
+        wrapped = _make_session_pool_tool(original_tool, "server", {"transport": "stdio", "command": "x", "args": []}, binding=_binding_for("server", {"transport": "stdio", "command": "x", "args": []}), pool=get_session_pool())
 
         # No thread_id in runtime at all.
         await wrapped.coroutine(runtime=None, x=1)
 
     pool = get_session_pool()
-    assert ("server", "test-user-autouse:default") in {k[:2] for k in pool._entries}
+    assert (_res("server"), "test-user-autouse:default") in {k[:2] for k in pool._entries}
 
 
 @pytest.mark.asyncio
@@ -1670,13 +1579,13 @@ async def test_session_pool_tool_get_config_fallback():
         patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm),
         patch("deerflow.mcp.tools.get_config", return_value=fake_config),
     ):
-        wrapped = _make_session_pool_tool(original_tool, "server", {"transport": "stdio", "command": "x", "args": []})
+        wrapped = _make_session_pool_tool(original_tool, "server", {"transport": "stdio", "command": "x", "args": []}, binding=_binding_for("server", {"transport": "stdio", "command": "x", "args": []}), pool=get_session_pool())
 
         # runtime=None — get_config() fallback should provide thread_id
         await wrapped.coroutine(runtime=None, x=1)
 
     pool = get_session_pool()
-    assert ("server", "test-user-autouse:from-langgraph-config") in {k[:2] for k in pool._entries}
+    assert (_res("server"), "test-user-autouse:from-langgraph-config") in {k[:2] for k in pool._entries}
 
 
 def test_session_pool_tool_sync_wrapper_path_is_safe():
@@ -1707,7 +1616,7 @@ def test_session_pool_tool_sync_wrapper_path_is_safe():
     connection = {"transport": "stdio", "command": "pw", "args": []}
 
     with patch("langchain_mcp_adapters.sessions.create_session", return_value=mock_cm):
-        wrapped = _make_session_pool_tool(original_tool, "playwright", connection)
+        wrapped = _make_session_pool_tool(original_tool, "playwright", connection, binding=_binding_for("playwright", connection), pool=get_session_pool())
         # Attach the sync wrapper exactly as get_mcp_tools() does.
         wrapped.func = make_sync_tool_wrapper(wrapped.coroutine, wrapped.name)
 
@@ -2015,7 +1924,7 @@ async def test_close_scope_does_not_cross_tasks():
 
     assert cms[0].closed is True
     assert cms[1].closed is False
-    assert ("s", "t2") in {k[:2] for k in pool._entries}
+    assert (_res("s"), "t2") in {k[:2] for k in pool._entries}
 
 
 @pytest.mark.asyncio
@@ -2185,7 +2094,7 @@ async def test_get_session_cancelled_during_eviction_teardown_does_not_leak():
 
     loop = asyncio.get_running_loop()
     victim_task = asyncio.create_task(victim_owner())
-    pool._entries[("victim", "scope", asyncio.get_running_loop(), "deployment")] = (MagicMock(), loop, victim_task, asyncio.Event())
+    pool._entries[(_res("victim"), "scope", asyncio.get_running_loop())] = (MagicMock(), loop, victim_task, asyncio.Event())
 
     gate = asyncio.Event()
     cms: list[_BlockingInitCm] = []
@@ -2202,10 +2111,10 @@ async def test_get_session_cancelled_during_eviction_teardown_does_not_leak():
             # The creator publishes its in-flight record before awaiting the
             # hung victim, so this is deterministic.
             for _ in range(100):
-                if ("srv", "scope-2") in {k[:2] for k in pool._inflight}:
+                if (_res("srv"), "scope-2") in {k[:2] for k in pool._inflight}:
                     break
                 await asyncio.sleep(0.01)
-            assert ("srv", "scope-2") in {k[:2] for k in pool._inflight}
+            assert (_res("srv"), "scope-2") in {k[:2] for k in pool._inflight}
             await asyncio.sleep(0.02)
 
             call.cancel()
@@ -2223,7 +2132,7 @@ async def test_get_session_cancelled_during_eviction_teardown_does_not_leak():
             await asyncio.sleep(0.01)
         assert cms, "owner task must have been created"
         assert cms[0].closed, "owner must run __aexit__ after Phase-2 cancellation"
-        assert ("srv", "scope-2") not in {k[:2] for k in pool._inflight}
+        assert (_res("srv"), "scope-2") not in {k[:2] for k in pool._inflight}
 
         current = asyncio.current_task()
         leaked = [t for t in asyncio.all_tasks() if t is not current and not t.done() and "_run_session" in str(t.get_coro())]
@@ -2264,7 +2173,7 @@ async def test_cancelled_creator_does_not_close_session_held_by_joiner():
 
     loop = asyncio.get_running_loop()
     victim_task = asyncio.create_task(victim_owner())
-    pool._entries[("victim", "scope", asyncio.get_running_loop(), "deployment")] = (MagicMock(), loop, victim_task, asyncio.Event())
+    pool._entries[(_res("victim"), "scope", asyncio.get_running_loop())] = (MagicMock(), loop, victim_task, asyncio.Event())
 
     gate = asyncio.Event()
     cms: list[_BlockingInitCm] = []
@@ -2282,10 +2191,10 @@ async def test_cancelled_creator_does_not_close_session_held_by_joiner():
             # The creator publishes its in-flight record before awaiting the
             # hung victim, so this is deterministic.
             for _ in range(100):
-                if ("srv", "scope-2") in {k[:2] for k in pool._inflight}:
+                if (_res("srv"), "scope-2") in {k[:2] for k in pool._inflight}:
                     break
                 await asyncio.sleep(0.01)
-            assert ("srv", "scope-2") in {k[:2] for k in pool._inflight}
+            assert (_res("srv"), "scope-2") in {k[:2] for k in pool._inflight}
 
             # The owner finishes initialize() and commits while its creator is
             # still parked on the victim's teardown. The second caller then
@@ -2304,9 +2213,9 @@ async def test_cancelled_creator_does_not_close_session_held_by_joiner():
 
             await asyncio.sleep(0.02)
             assert not cms[0].closed, "cancelling the creator must not close a session already handed to a caller"
-            assert ("srv", "scope-2") in {k[:2] for k in pool._entries}, "committed session must stay registered after creator cancellation"
-            assert pool._entries[("srv", "scope-2", asyncio.get_running_loop(), "deployment")][0] is session, "the joiner's session must be the registered one"
-            assert ("srv", "scope-2") not in {k[:2] for k in pool._inflight}
+            assert (_res("srv"), "scope-2") in {k[:2] for k in pool._entries}, "committed session must stay registered after creator cancellation"
+            assert pool._entries[(_res("srv"), "scope-2", asyncio.get_running_loop())][0] is session, "the joiner's session must be the registered one"
+            assert (_res("srv"), "scope-2") not in {k[:2] for k in pool._inflight}
 
         # Cleanup: close the pool so the parked owner finishes deterministically.
         await pool.close_all()
@@ -2352,10 +2261,10 @@ async def test_joiner_follows_creation_outcome_when_creator_is_cancelled():
         conn = {"transport": "stdio", "command": "x", "args": []}
         creator = asyncio.create_task(pool.get_session("s", "same", conn))
         for _ in range(100):
-            if ("s", "same") in {k[:2] for k in pool._inflight}:
+            if (_res("s"), "same") in {k[:2] for k in pool._inflight}:
                 break
             await asyncio.sleep(0.01)
-        assert ("s", "same") in {k[:2] for k in pool._inflight}
+        assert (_res("s"), "same") in {k[:2] for k in pool._inflight}
 
         # Second caller joins the in-flight creation instead of duplicating it.
         joiner = asyncio.create_task(pool.get_session("s", "same", conn))
@@ -2417,8 +2326,8 @@ async def test_eviction_teardown_completes_normally_then_session_is_returned():
 
     assert first is not second
     assert cms[0].closed, "evicted owner must complete teardown before the caller proceeds"
-    assert ("s", "t2") in {k[:2] for k in pool._entries}
-    assert ("s", "t1") not in {k[:2] for k in pool._entries}
+    assert (_res("s"), "t2") in {k[:2] for k in pool._entries}
+    assert (_res("s"), "t1") not in {k[:2] for k in pool._entries}
 
 
 @pytest.mark.asyncio
@@ -2474,8 +2383,8 @@ async def test_cancelling_close_scope_does_not_strand_other_removed_owners():
 
     first_task = asyncio.create_task(first_owner())
     second_task = asyncio.create_task(second_owner())
-    pool._entries[("s1", "scope", asyncio.get_running_loop(), "deployment")] = (MagicMock(), loop, first_task, first_close)
-    pool._entries[("s2", "scope", asyncio.get_running_loop(), "deployment")] = (MagicMock(), loop, second_task, second_close)
+    pool._entries[(_res("s1"), "scope", asyncio.get_running_loop())] = (MagicMock(), loop, first_task, first_close)
+    pool._entries[(_res("s2"), "scope", asyncio.get_running_loop())] = (MagicMock(), loop, second_task, second_close)
 
     closer = asyncio.create_task(pool.close_scope("scope"))
     # Let the closer reach its teardown await (both signals are already out).
@@ -2668,7 +2577,7 @@ async def test_queued_cancel_rechecks_failure_on_owning_loop():
     gate2 = holder["gate"]
 
     proxy = _DelayedLoop(loop2)
-    pool._inflight[("s", "t1", proxy, "deployment")] = (proxy, holder["ready"], holder["task"], holder["close_evt"])
+    pool._inflight[(_res("s"), "t1", proxy)] = (proxy, holder["ready"], holder["task"], holder["close_evt"])
 
     # Snapshot moment: the owner has NOT failed yet. close_scope's signal phase
     # queues the (guarded) cancellation into the holding proxy; its await phase
@@ -2809,7 +2718,7 @@ async def test_close_all_during_in_flight_creation_does_not_resurrect_session():
         call = asyncio.create_task(pool.get_session("s", "t1", conn))
         # Let the owner task enter the CM and reach the blocking initialize().
         await asyncio.sleep(0.01)
-        assert ("s", "t1") in {k[:2] for k in pool._inflight}
+        assert (_res("s"), "t1") in {k[:2] for k in pool._inflight}
 
         # Close everything while the creation is still in-flight.
         await pool.close_all()
@@ -3096,7 +3005,7 @@ async def test_mcp_tools_routed_to_source_server_with_prefix_overlap():
 
     routed: list[tuple[str, str]] = []
 
-    def fake_wrap(tool, server_name, connection, interceptors, tool_call_timeout=None, session_init_timeout=None, tool_name_prefix=True):
+    def fake_wrap(tool, server_name, connection, interceptors, tool_call_timeout=None, session_init_timeout=None, tool_name_prefix=True, pool=None, binding=None):
         routed.append((tool.name, server_name))
         return tool
 
@@ -3121,3 +3030,378 @@ async def test_mcp_tools_routed_to_source_server_with_prefix_overlap():
     routing = dict(routed)
     assert routing["web_scraper_search"] == "web_scraper", f"tool mis-routed to {routing.get('web_scraper_search')!r}, expected 'web_scraper'"
     assert routing["web_open"] == "web"
+
+
+# ---------------------------------------------------------------------------
+# stdio wrappers bind to a server-scoped epoch before discovery
+# ---------------------------------------------------------------------------
+
+
+def _stdio_tool_for_binding_tests(name: str):
+    from langchain_core.tools import StructuredTool
+    from pydantic import BaseModel
+
+    class Args(BaseModel):
+        value: int = 1
+
+    return StructuredTool(
+        name=name,
+        description="test",
+        args_schema=Args,
+        coroutine=AsyncMock(),
+        response_format="content_and_artifact",
+    )
+
+
+def _session_factory(sink: list):
+    def make_cm(*_args, **_kwargs):
+        session = AsyncMock()
+        session.call_tool = AsyncMock(return_value=MagicMock(content=[], isError=False, structuredContent=None))
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=session)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        sink.append(session)
+        return cm
+
+    return make_cm
+
+
+@pytest.mark.asyncio
+async def test_bound_stdio_tool_reuses_session_across_per_call_workspaces(tmp_path):
+    """Different per-call cwd/TMPDIR must not invalidate the captured binding."""
+    from deerflow.config.paths import Paths
+    from deerflow.mcp.session_pool import normalized_connection_fingerprint
+    from deerflow.mcp.tools import _make_session_pool_tool
+
+    connection = {"transport": "stdio", "command": "x", "args": []}
+    pool = get_session_pool()
+    binding = pool.bind_server("srv", normalized_connection_fingerprint(connection))
+
+    created: list = []
+    runtime = MagicMock()
+    runtime.context = {"thread_id": "thread-1", "user_id": "user-1", "thread_incarnation": "inc-1"}
+    runtime.config = {}
+
+    scope_key = mcp_session_scope_key(user_id="user-1", thread_id="thread-1", thread_incarnation="inc-1")
+    loop = asyncio.get_running_loop()
+    # Two different workspace roots for the SAME scope: the augmented
+    # session_connection (cwd/TMPDIR) differs between the two calls.
+    workspaces = iter([Paths(tmp_path / "ws-a"), Paths(tmp_path / "ws-b")])
+
+    with (
+        patch("deerflow.mcp.tools.get_paths", side_effect=lambda: next(workspaces)),
+        patch("langchain_mcp_adapters.sessions.create_session", side_effect=_session_factory(created)) as create_session,
+    ):
+        wrapped = _make_session_pool_tool(_stdio_tool_for_binding_tests("srv_act"), "srv", connection, binding=binding, pool=pool)
+        await wrapped.coroutine(runtime=runtime, value=1)
+        first_session = pool._entries[(_res("srv"), scope_key, loop)][0]
+        await wrapped.coroutine(runtime=runtime, value=2)
+        second_session = pool._entries[(_res("srv"), scope_key, loop)][0]
+
+    assert create_session.call_count == 1
+    assert first_session is second_session is created[0]
+
+
+@pytest.mark.asyncio
+async def test_bound_stdio_tool_isolates_threads_without_stale_error(tmp_path):
+    """Two thread scopes each get their own session under one stable binding."""
+    from deerflow.config.paths import Paths
+    from deerflow.mcp.session_pool import normalized_connection_fingerprint
+    from deerflow.mcp.tools import _make_session_pool_tool
+
+    connection = {"transport": "stdio", "command": "x", "args": []}
+    pool = get_session_pool()
+    binding = pool.bind_server("srv", normalized_connection_fingerprint(connection))
+
+    created: list = []
+    runtime_a = MagicMock()
+    runtime_a.context = {"thread_id": "thread-1", "user_id": "user-1", "thread_incarnation": "inc-1"}
+    runtime_a.config = {}
+    runtime_b = MagicMock()
+    runtime_b.context = {"thread_id": "thread-2", "user_id": "user-2", "thread_incarnation": "inc-1"}
+    runtime_b.config = {}
+
+    with (
+        patch("deerflow.mcp.tools.get_paths", return_value=Paths(tmp_path)),
+        patch("langchain_mcp_adapters.sessions.create_session", side_effect=_session_factory(created)) as create_session,
+    ):
+        wrapped = _make_session_pool_tool(_stdio_tool_for_binding_tests("srv_act"), "srv", connection, binding=binding, pool=pool)
+        # Neither call may raise StaleMCPBindingError, and the binding must not
+        # advance between them (the per-thread workspace must not mint an epoch).
+        await wrapped.coroutine(runtime=runtime_a, value=1)
+        assert pool.active_binding("srv") is binding
+        await wrapped.coroutine(runtime=runtime_b, value=2)
+        assert pool.active_binding("srv") is binding
+
+    assert create_session.call_count == 2
+    assert len(created) == 2
+    assert created[0] is not created[1]
+    assert len([key for key in pool._entries if key[0] == _res("srv")]) == 2
+
+
+def _gated_mcp_config(server_name: str):
+    from deerflow.config.extensions_config import McpServerConfig
+
+    server_cfg = McpServerConfig(type="stdio", command="x", args=[])
+    extensions_config = MagicMock()
+    extensions_config.mcp_servers = {server_name: server_cfg}
+    extensions_config.get_enabled_mcp_servers.return_value = {server_name: server_cfg}
+    extensions_config.model_extra = {}
+    return extensions_config
+
+
+@pytest.mark.asyncio
+async def test_get_mcp_tools_binds_before_discovery_await(tmp_path):
+    """The binding is resolved before discovery; a mid-discovery change fences the tool."""
+    from deerflow.config.paths import Paths
+    from deerflow.mcp.session_pool import StaleMCPBindingError, normalized_connection_fingerprint
+    from deerflow.mcp.tools import get_mcp_tools
+
+    server_name = "A"
+    servers_config = {server_name: {"transport": "stdio", "command": "x", "args": []}}
+    extensions_config = _gated_mcp_config(server_name)
+    server_tool = _stdio_tool_for_binding_tests("A_echo")
+
+    runtime = MagicMock()
+    runtime.context = {"thread_id": "t1", "user_id": "u1", "thread_incarnation": "inc-1"}
+    runtime.config = {}
+
+    created: list = []
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def gated_get_tools(*, server_name: str | None = None):
+        entered.set()
+        await gate.wait()
+        return [server_tool]
+
+    pool = get_session_pool()
+    with (
+        patch("deerflow.mcp.tools.build_servers_config", return_value=servers_config),
+        patch("deerflow.mcp.tools.get_initial_oauth_headers", return_value={}),
+        patch("deerflow.mcp.tools.build_oauth_tool_interceptor", return_value=None),
+        patch("langchain_mcp_adapters.client.MultiServerMCPClient") as MockClient,
+        patch("deerflow.mcp.tools.get_paths", return_value=Paths(tmp_path)),
+        patch("langchain_mcp_adapters.sessions.create_session", side_effect=_session_factory(created)) as create_session,
+    ):
+        MockClient.return_value.get_tools = AsyncMock(side_effect=gated_get_tools)
+        task = asyncio.create_task(get_mcp_tools(extensions_config=extensions_config))
+        await entered.wait()
+        # The binding must already exist while discovery is still blocked: it is
+        # resolved BEFORE the first discovery await, never after it.
+        seeded = pool.active_binding(server_name)
+        assert seeded is not None
+        assert seeded.fingerprint == normalized_connection_fingerprint(servers_config[server_name])
+        # Invalidate A while its discovery is in flight, then let it finish.
+        pool.reconcile_bindings({server_name: "new-fp"}, ())
+        gate.set()
+        tools = await task
+
+        assert len(tools) == 1
+        with pytest.raises(StaleMCPBindingError):
+            await tools[0].coroutine(runtime=runtime, value=1)
+
+    assert create_session.call_count == 0
+    assert list(pool._entries.keys()) == []
+
+
+@pytest.mark.asyncio
+async def test_get_mcp_tools_captures_pool_with_binding_before_discovery_await(tmp_path):
+    """A global reset during discovery must not bind an old binding to a fresh pool.
+
+    Both pools start their epoch counters at 1, so a replacement pool that has
+    seeded the same fingerprint exposes the ABA comparison. The produced wrapper
+    must keep the old pool captured before discovery and fail on that retired pool
+    instead of creating a session in the replacement.
+    """
+    from deerflow.config.paths import Paths
+    from deerflow.mcp.session_pool import StaleMCPBindingError, normalized_connection_fingerprint
+    from deerflow.mcp.tools import get_mcp_tools
+
+    server_name = "A"
+    servers_config = {server_name: {"transport": "stdio", "command": "x", "args": []}}
+    extensions_config = _gated_mcp_config(server_name)
+    server_tool = _stdio_tool_for_binding_tests("A_echo")
+
+    runtime = MagicMock()
+    runtime.context = {"thread_id": "t1", "user_id": "u1", "thread_incarnation": "inc-1"}
+    runtime.config = {}
+
+    created: list = []
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def gated_get_tools(*, server_name: str | None = None):
+        entered.set()
+        await gate.wait()
+        return [server_tool]
+
+    old_pool = get_session_pool()
+    with (
+        patch("deerflow.mcp.tools.build_servers_config", return_value=servers_config),
+        patch("deerflow.mcp.tools.get_initial_oauth_headers", return_value={}),
+        patch("deerflow.mcp.tools.build_oauth_tool_interceptor", return_value=None),
+        patch("langchain_mcp_adapters.client.MultiServerMCPClient") as MockClient,
+        patch("deerflow.mcp.tools.get_paths", return_value=Paths(tmp_path)),
+        patch("langchain_mcp_adapters.sessions.create_session", side_effect=_session_factory(created)) as create_session,
+    ):
+        MockClient.return_value.get_tools = AsyncMock(side_effect=gated_get_tools)
+        task = asyncio.create_task(get_mcp_tools(extensions_config=extensions_config))
+        await entered.wait()
+
+        old_binding = old_pool.active_binding(server_name)
+        assert old_binding is not None
+
+        assert reset_session_pool() is old_pool
+        replacement_pool = get_session_pool()
+        replacement_binding = replacement_pool.ensure_binding(
+            server_name,
+            normalized_connection_fingerprint(servers_config[server_name]),
+        )
+        assert replacement_binding == old_binding, "test must exercise the ABA-equal epoch"
+
+        gate.set()
+        tools = await task
+
+        assert len(tools) == 1
+        with pytest.raises(StaleMCPBindingError):
+            await tools[0].coroutine(runtime=runtime, value=1)
+
+    assert create_session.call_count == 0
+    assert not replacement_pool._entries
+    assert not replacement_pool._inflight
+
+
+@pytest.mark.asyncio
+async def test_get_mcp_tools_seeds_binding_for_first_seen_stdio_server(tmp_path):
+    """A first-seen stdio server seeds a binding and its wrapped tool works."""
+    from deerflow.config.paths import Paths
+    from deerflow.mcp.session_pool import normalized_connection_fingerprint
+    from deerflow.mcp.tools import get_mcp_tools
+
+    server_name = "A"
+    servers_config = {server_name: {"transport": "stdio", "command": "x", "args": []}}
+    extensions_config = _gated_mcp_config(server_name)
+    server_tool = _stdio_tool_for_binding_tests("A_echo")
+
+    runtime = MagicMock()
+    runtime.context = {"thread_id": "t1", "user_id": "u1", "thread_incarnation": "inc-1"}
+    runtime.config = {}
+
+    created: list = []
+    pool = get_session_pool()
+    with (
+        patch("deerflow.mcp.tools.build_servers_config", return_value=servers_config),
+        patch("deerflow.mcp.tools.get_initial_oauth_headers", return_value={}),
+        patch("deerflow.mcp.tools.build_oauth_tool_interceptor", return_value=None),
+        patch("langchain_mcp_adapters.client.MultiServerMCPClient") as MockClient,
+        patch("deerflow.mcp.tools.get_paths", return_value=Paths(tmp_path)),
+        patch("langchain_mcp_adapters.sessions.create_session", side_effect=_session_factory(created)) as create_session,
+    ):
+        MockClient.return_value.get_tools = AsyncMock(return_value=[server_tool])
+        tools = await get_mcp_tools(extensions_config=extensions_config)
+
+        binding = pool.active_binding(server_name)
+        assert binding is not None
+        assert binding.fingerprint == normalized_connection_fingerprint(servers_config[server_name])
+
+        assert len(tools) == 1
+        await tools[0].coroutine(runtime=runtime, value=1)
+
+    assert create_session.call_count == 1
+    assert len(created) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_mcp_tools_fails_closed_when_discovery_binding_is_stale(tmp_path):
+    """A stale discovery binding must raise, never silently rebind the server.
+
+    Locks the intended fail-closed behavior: when the pool has already
+    reconciled a server to a newer epoch, resolving that server's discovery
+    binding from a superseded config raises ``StaleMCPBindingError`` and leaves
+    the reconciled binding untouched. Discovery must never mint a replacement
+    epoch for itself.
+    """
+    from deerflow.config.paths import Paths
+    from deerflow.mcp.session_pool import StaleMCPBindingError
+    from deerflow.mcp.tools import get_mcp_tools
+
+    server_name = "A"
+    servers_config = {server_name: {"transport": "stdio", "command": "x", "args": []}}
+    extensions_config = _gated_mcp_config(server_name)
+    server_tool = _stdio_tool_for_binding_tests("A_echo")
+
+    created: list = []
+    pool = get_session_pool()
+    # A config change already committed a newer epoch for A while this revision
+    # was being discovered.
+    pool.reconcile_bindings({server_name: "newer-fp"}, ())
+    reconciled = pool.active_binding(server_name)
+
+    with (
+        patch("deerflow.mcp.tools.build_servers_config", return_value=servers_config),
+        patch("deerflow.mcp.tools.get_initial_oauth_headers", return_value={}),
+        patch("deerflow.mcp.tools.build_oauth_tool_interceptor", return_value=None),
+        patch("langchain_mcp_adapters.client.MultiServerMCPClient") as MockClient,
+        patch("deerflow.mcp.tools.get_paths", return_value=Paths(tmp_path)),
+        patch("langchain_mcp_adapters.sessions.create_session", side_effect=_session_factory(created)) as create_session,
+    ):
+        MockClient.return_value.get_tools = AsyncMock(return_value=[server_tool])
+        with pytest.raises(StaleMCPBindingError):
+            await get_mcp_tools(extensions_config=extensions_config)
+        # Resolution happens before discovery, so the stale server never reaches
+        # tool discovery and never silently rebinds.
+        MockClient.return_value.get_tools.assert_not_called()
+
+    assert pool.active_binding(server_name) is reconciled
+    assert pool.active_binding(server_name).fingerprint == "newer-fp"
+    assert create_session.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_close_thread_scope_spans_domains_without_retiring_bindings():
+    """Thread cleanup is scope teardown, not server lifecycle invalidation.
+
+    Locks the two boundaries a naive thread-cleanup x ownership-domain merge
+    could break: the teardown must span *both* ownership domains (a deleted
+    thread's deployment and personal sessions are equally stale), and it must
+    not touch the resource bindings -- a tombstone there would fence every other
+    thread's healthy session for the same server.
+    """
+    pool = MCPSessionPool()
+    connection = {"transport": "stdio", "command": "x", "args": []}
+    fingerprint = normalized_connection_fingerprint(connection)
+
+    deployment = pool.ensure_binding("same", fingerprint, domain="deployment")
+    personal = pool.ensure_binding("same", fingerprint, domain="personal")
+
+    target = mcp_session_scope_key(user_id="u1", thread_id="t1", thread_incarnation="inc-1")
+    other = mcp_session_scope_key(user_id="u1", thread_id="t2", thread_incarnation="inc-1")
+
+    closed: list[object] = []
+
+    class Cm:
+        async def __aenter__(self):
+            return AsyncMock()
+
+        async def __aexit__(self, *args):
+            closed.append(self)
+            return False
+
+    def make_cm(*_args, **_kwargs):
+        return Cm()
+
+    with patch("langchain_mcp_adapters.sessions.create_session", side_effect=make_cm):
+        # The deleted thread holds one session in each domain; another thread of
+        # the same user holds an unrelated one.
+        await pool.get_session("same", target, connection, binding=deployment)
+        await pool.get_session("same", target, connection, binding=personal)
+        await pool.get_session("same", other, connection, binding=deployment)
+
+    await pool.close_thread_scope(user_id="u1", thread_id="t1")
+
+    assert len(closed) == 2, "the deleted thread's sessions must close in every domain"
+    assert (_res("same"), other) in {k[:2] for k in pool._entries}, "another thread's session must survive"
+    # Scope teardown must never retire or advance a resource binding.
+    assert pool.active_binding("same") == deployment
+    assert pool.active_binding("same", domain="personal") == personal
