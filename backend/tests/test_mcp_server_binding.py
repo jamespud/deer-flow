@@ -160,6 +160,49 @@ async def test_reconcile_fences_creator_and_joiner_waiting_on_same_creation():
 
 
 @pytest.mark.asyncio
+async def test_reconcile_after_ready_commit_fences_creator_and_joiner_return():
+    """A successful ready Future is not sufficient once its binding is superseded."""
+    pool = MCPSessionPool()
+    old = pool.ensure_binding("A", "a1")
+    gate = asyncio.Event()
+    cm = _GatedInitCm(gate)
+
+    prepared_holder = []
+    with patch("langchain_mcp_adapters.sessions.create_session", return_value=cm):
+        creator = asyncio.create_task(pool.get_session("A", "u:t", _CONNECTION, binding=old))
+        await asyncio.wait_for(cm.initialize_started.wait(), timeout=1)
+
+        # Capture the owner's ready Future after the creator has installed its
+        # shield callback, then register reconciliation on that Future. Future
+        # callbacks are queued when set_result() runs; this callback therefore
+        # executes only after the owner committed the session, but before the
+        # waiting tasks are scheduled back through their shield Futures.
+        ready = next(iter(pool._inflight.values()))[1]
+
+        def supersede_after_commit(_ready):
+            assert _ready.done() and _ready.exception() is None
+            prepared_holder.append(pool.reconcile_bindings({"A": "a2"}, ()))
+
+        ready.add_done_callback(supersede_after_commit)
+
+        joiner = asyncio.create_task(pool.get_session("A", "u:t", _CONNECTION, binding=old))
+        await asyncio.sleep(0)
+        gate.set()
+
+        with pytest.raises(StaleMCPBindingError):
+            await asyncio.wait_for(creator, timeout=1)
+        with pytest.raises(StaleMCPBindingError):
+            await asyncio.wait_for(joiner, timeout=1)
+
+    assert len(prepared_holder) == 1
+    prepared = prepared_holder[0]
+    assert len(prepared.entries) == 1
+    assert prepared.inflight == ()
+    await pool.close_prepared_owners(prepared)
+    assert cm.closed is True
+
+
+@pytest.mark.asyncio
 async def test_remove_readd_same_fingerprint_does_not_reauthorize_old_binding():
     pool = MCPSessionPool()
     old = pool.ensure_binding("A", "same")
