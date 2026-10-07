@@ -12,11 +12,22 @@
   `asyncio.run` fallback covers only `get_event_loop()` raising (no loop set, or a closed
   loop); a `RuntimeError` from discovery itself (e.g. `McpTaskConfigurationError`) is
   logged once and never triggers a second discovery pass.
-- **Loop- and ownership-isolated stdio sessions**: Both the live registry and in-flight creations
-  are keyed by `(server_name, scope_key, owning_loop, ownership_domain)`. Same-loop
+- **Loop-, ownership-, and binding-isolated stdio sessions**: Both the live registry and in-flight creations
+  stay keyed by `(server_name, scope_key, owning_loop, ownership_domain)`. Same-loop
   callers share initialization and state only inside the same `deployment` or
   `personal` domain; equal runtime names across those domains never share a
-  session. Server/pair cleanup and disconnect eviction stay inside the caller's
+  session. Independently, each `(ownership_domain, server_name)` has an opaque
+  `ServerBinding` capability derived from the base stdio process identity
+  (`transport`, `command`, `args`, configured `cwd`, configured `env`).
+  The fingerprint is a SHA-256 digest, so resolved environment values are not
+  retained in the binding. Discovery captures the exact pool plus binding before
+  its first await, and pooled creation checks that capability at admission,
+  owner commit, and creator/joiner return. Superseding or removing one binding
+  can therefore fence only that server without changing the PR A registry key;
+  a reset retires the old pool before publishing its replacement so stale
+  wrappers cannot create in the old singleton. Per-call workspace cwd/TMPDIR
+  augmentation happens after binding capture and does not change identity.
+  Server/pair cleanup and disconnect eviction stay inside the caller's
   domain, while scope, thread-identity and global cleanup intentionally span
   domains. Thread-identity cleanup
   (`close_thread_scope`) deliberately matches *every incarnation* of a
