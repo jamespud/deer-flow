@@ -116,6 +116,7 @@ async def test_stdio_task_call_reuses_exact_scope_and_raw_tool_name() -> None:
     pool = MagicMock()
     pool.get_session = AsyncMock(return_value=session)
     pool.close_session = AsyncMock()
+    binding = pool.ensure_binding.return_value
     caller = McpTaskToolCaller(_config())
 
     with (
@@ -139,6 +140,7 @@ async def test_stdio_task_call_reuses_exact_scope_and_raw_tool_name() -> None:
         "reports",
         "user-1:thread-1",
         {"transport": "stdio", "command": "report-mcp"},
+        binding=binding,
     )
     session.call_tool.assert_awaited_once_with("status_report", {"task_id": "remote-1"})
     pool.close_session.assert_not_awaited()
@@ -150,6 +152,7 @@ async def test_personal_stdio_task_call_uses_personal_pool_domain() -> None:
     session = SimpleNamespace(call_tool=AsyncMock(return_value=result))
     pool = MagicMock()
     pool.get_session = AsyncMock(return_value=session)
+    binding = pool.ensure_binding.return_value
 
     caller = McpTaskToolCaller(ExtensionsConfig())
     personal_caller = McpTaskToolCaller(_config())
@@ -177,7 +180,7 @@ async def test_personal_stdio_task_call_uses_personal_pool_domain() -> None:
         "reports",
         "user-1:thread-1",
         {"transport": "stdio", "command": "report-mcp"},
-        domain="personal",
+        binding=binding,
     )
     session.call_tool.assert_awaited_once_with("status_report", {"task_id": "remote-1"})
 
@@ -432,7 +435,7 @@ async def test_stdio_task_session_initialization_respects_configured_timeout() -
     config = _config()
     config.mcp_servers["reports"].session_init_timeout = 0.01
 
-    async def slow_get_session(*_args):
+    async def slow_get_session(*_args, **_kwargs):
         await asyncio.sleep(60)
 
     pool = MagicMock()
